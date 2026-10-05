@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/freerdp-sys",
+    "crates/desk-backend",
+    "crates/rdp-core",
+    "crates/backend-kde",
+    "crates/backend-wlroots",
+    "server",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.94"

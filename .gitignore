@@ -1,0 +1,17 @@
+/target
+**/target
+*.rs.bk
+Cargo.lock.orig
+
+# Local-only docs (kept out of the repo)
+/docs/
+/CLAUDE.md
+
+# Release artifacts (scripts/build-package.sh output)
+/dist/
+
+# Compiled test/tool binaries (built in-tree beside their sources)
+crates/freerdp-sys/tests/rfx_region_roundtrip
+crates/freerdp-sys/tools/wayrdp-probe
+tools/vmconnect-probe.exe
+tools/vsfwd.exe

@@ -1,0 +1,12 @@
+# Shell scripts and packaging must stay LF — bash/makepkg choke on CRLF.
+*.sh        text eol=lf
+PKGBUILD    text eol=lf
+*.install   text eol=lf
+
+# Rust source.
+*.rs        text eol=lf
+*.toml      text eol=lf
+
+# Binaries.
+*.png       binary
+*.ico       binary
