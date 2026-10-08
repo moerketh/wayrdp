@@ -1,0 +1,14 @@
+[package]
+name = "rdp-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wayrdp RDP server core on FreeRDP 3"
+
+[dependencies]
+desk-backend = { path = "../desk-backend" }
+freerdp-sys = { path = "../freerdp-sys" }
+anyhow = "1"
+crossbeam-channel = "0.5.17"
+libc = "0.2"
