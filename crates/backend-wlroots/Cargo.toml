@@ -1,0 +1,35 @@
+[package]
+name = "backend-wlroots"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wayrdp wlroots-class backend (Hyprland/Sway): headless virtual output + ext-image-copy-capture + virtual input"
+
+[dependencies]
+desk-backend = { path = "../desk-backend" }
+# RDP scancode → evdev keycode via WinPR's VK tables (F1). On non-freerdp
+# builds this crate compiles a stub and the legacy -8 map is used.
+freerdp-sys = { path = "../freerdp-sys" }
+# Same wayland-client line as hyperv-rdp-extras to keep one version
+# in one lockfile. backend-wlroots self-binds (no extras dep) so it stays
+# compositor-agnostic (Hyprland AND Sway), not KWin-specific.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# zwp_virtual_keyboard_manager_v1 lives in wayland-protocols-misc, NOT
+# wayland-protocols-wlr (despite the protocol's `zwlr` C alias).
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+anyhow = "1"
+thiserror = "1"
+# Full evdev/us keymap for the virtual keyboard: xkbcommon compiles the same
+# pc105/evdev keymap the compositor uses, so injected evdev keycodes resolve
+# to keysyms (an empty hand-rolled keymap left Hyprland dropping every key).
+xkbcommon = "0.8"
+serde_json = "1"
+crossbeam-channel = "0.5.17"
+# Shm-based capture path that consumes frames from the hyprland-capture
+# plugin (WAYRDP_CAPTURE=shm-plugin). Locks down a /dev/shm mmap owned by
+# the plugin's Hyprland process; we only read.
+memmap2 = "0.9"
+libc = "0.2"
