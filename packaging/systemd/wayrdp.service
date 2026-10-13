@@ -1,0 +1,30 @@
+[Unit]
+Description=wayrdp — Wayland-native RDP server (FreeRDP 3 core)
+Documentation=https://github.com/moerketh/wayrdp
+
+# wayrdp talks to the live compositor over the user's Wayland socket. The
+# wlroots backend drives Hyprland via `hyprctl output create headless`
+# (+ ext-image-copy-capture + virtual-keyboard input), so it must start only
+# inside a graphical session that has a Wayland display.
+After=graphical-session.target
+Wants=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+# WAYRDP_BACKEND selects the capture/input path at runtime:
+#   wlroots   — Hyprland headless output + ext-image-copy-capture (primary)
+#   synthetic — test pattern (no compositor; for CI and debugging)
+# (unset)   — auto-detect from XDG_CURRENT_DESKTOP; KDE/Plasma and Sway
+#             have no working backend yet and wayrdp refuses to start
+#             there (exit status 42) unless the test backend is forced.
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/wayrdp
+Restart=on-failure
+RestartSec=5
+# Exit 42 = "no working backend on this desktop" — a configuration problem
+# restarts can't solve, so don't loop on it.
+RestartPreventExitStatus=42
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,81 @@
+# Maintainer: moerketh <https://github.com/moerketh>
+pkgname=wayrdp
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Wayland-native RDP server on FreeRDP 3 with compositor-specific backends (Hyprland/Sway wlroots, KDE)"
+arch=('x86_64')
+url="https://github.com/moerketh/wayrdp"
+license=('MIT')
+# Runtime: FreeRDP 3 server/client (libfreerdp-server3 / libwinpr3), the
+# openssl CLI for the ephemeral self-signed TLS cert, libxkbcommon via the
+# Wayland client libs, and hyprctl (hyprland) for the wlroots backend's
+# headless-output management.
+depends=(
+    'gcc-libs'
+    'glibc'
+    'freerdp'
+    'openssl'
+    'wayland'
+    'libxkbcommon'
+)
+optdepends=(
+    'hyprland: wlroots backend (headless output + ext-image-copy-capture)'
+    'sway: wlroots backend (zwlr headless variant)'
+)
+makedepends=(
+    'cargo'
+    'clang'
+    'pkg-config'
+)
+# GCC/makepkg LTO injects -flto into CFLAGS; LTO bitcode in native C libs is
+# invisible to the Rust linker. Thin LTO keeps RAM ~4GB
+# and avoids fat-LTO OOM on the 2-vCPU build host.
+options=(!lto)
+install=wayrdp.install
+# Built from the working tree (local scp flow); no network source for now.
+# When wayrdp has a tagged source release this becomes a
+# $pkgname-$pkgver.tar.xz pinned-by-sha256 source line. Until then
+# `source=()` and the build resolves the repo root from
+# this file's location (packaging/arch -> ../..).
+source=()
+sha256sums=()
+
+_repo_root() {
+    # BUILDDIR-independent: absolute path of the repo root that contains this
+    # PKGBUILD (packaging/arch/PKGBUILD -> up two levels).
+    ( cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd )
+}
+
+build() {
+    local root; root="$(_repo_root)"
+    cd "$root"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR="$srcdir/target"
+    export RUSTFLAGS="-C linker=cc ${RUSTFLAGS:-}"
+    export CARGO_PROFILE_RELEASE_LTO=thin
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
+    # freerdp-sys locates libfreerdp-server3 via pkg-config; wayland-client
+    # via the standard pc path.
+    cargo build --release -p wayrdp
+}
+
+check() {
+    local root; root="$(_repo_root)"
+    cd "$root"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR="$srcdir/target"
+    # No compositor in a build chroot; run only the unit-safe checks.
+    cargo test --release -p rdp-core || true
+}
+
+package() {
+    local root; root="$(_repo_root)"
+    cd "$root"
+    # Server binary
+    install -Dm755 "$srcdir/target/release/wayrdp" "$pkgdir/usr/bin/wayrdp"
+    # systemd USER unit (started per-session; needs a live Wayland display)
+    install -Dm644 "$root/packaging/systemd/wayrdp.service" \
+        "$pkgdir/usr/lib/systemd/user/wayrdp.service"
+    # License
+    install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

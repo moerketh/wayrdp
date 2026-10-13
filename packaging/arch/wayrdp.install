@@ -1,0 +1,29 @@
+# wayrdp.install — post-install/remove messages for the Arch package.
+#
+# wayrdp runs as a systemd USER unit (it needs the live Wayland session), not
+# a system service. After pacman installs the unit into
+# /usr/lib/systemd/user/, `systemctl --user daemon-reload` + enable must come
+# from the target user's manager — the VMCreate installer does that for the
+# autologin user (and enables linger). Here we only print guidance.
+
+post_install() {
+    cat <<'MSG'
+==> wayrdp is a systemd USER unit (needs the live Wayland session).
+    Enable + start it for the desktop user, e.g.:
+        systemctl --user daemon-reload
+        systemctl --user enable --now wayrdp.service
+    To have it survive logout (RDP before the local session logs in):
+        sudo loginctl enable-linger <user>
+    The default WAYRDP_BACKEND=wlroots requires hyprctl on PATH (Hyprland);
+    edit the unit's Environment to select kde or synthetic instead.
+MSG
+}
+
+post_upgrade() {
+    post_install
+}
+
+post_remove() {
+    echo "==> wayrdp removed. Disable the user unit if still enabled:"
+    echo "      systemctl --user disable --now wayrdp.service"
+}
