@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build a local release package for wayrdp (scp flow — no GitHub release yet).
+# Build a release package for wayrdp. Used directly for local builds and by
+# the tag-triggered CI release pipeline (.github/workflows/release.yml).
 #
 # Produces under dist/release/:
 #   wayrdp-<ver>-linux-x86_64.tar.gz   portable bundle (bin/wayrdp + systemd

@@ -109,6 +109,10 @@ systemd **user** unit (`/usr/local` prefix, works on Arch and Debian
 family); Arch users can instead build from `packaging/arch/PKGBUILD`. The
 unit requires a Wayland session (`ConditionEnvironment=WAYLAND_DISPLAY`).
 
+Pushing a `v<version>` tag builds the same package in CI
+(`.github/workflows/release.yml`) and attaches the tarball, `.deb`, and
+`SHA256SUMS` to a GitHub Release for direct download.
+
 ## Validating
 
 * **Harness (primary gate):** from a Windows host, run
