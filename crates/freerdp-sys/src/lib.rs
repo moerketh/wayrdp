@@ -17,5 +17,4 @@ mod inner {
 pub use inner::*;
 
 #[cfg(not(freerdp_present))]
-pub const FREERDP_MISSING: &str =
-    "FreeRDP 3 dev libraries not found — install freerdp3-dev";
+pub const FREERDP_MISSING: &str = "FreeRDP 3 dev libraries not found — install freerdp3-dev";

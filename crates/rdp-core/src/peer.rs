@@ -1027,7 +1027,11 @@ unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
                 1,
                 libc::MSG_PEEK | libc::MSG_DONTWAIT,
             );
-            let state = if (*ctx).activated { "activated" } else { "activating" };
+            let state = if (*ctx).activated {
+                "activated"
+            } else {
+                "activating"
+            };
             // Only an orderly shutdown (clean 0) or a hard socket error is
             // terminal. EAGAIN means "no data right now" — the peer is merely
             // idle, NOT closed, so never treat it as EOF.
@@ -1037,7 +1041,9 @@ unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
             } else if r < 0 {
                 let err = *libc::__errno_location();
                 if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
-                    eprintln!("[peer_mainloop] peer socket error {err} during <{state}>; tearing down");
+                    eprintln!(
+                        "[peer_mainloop] peer socket error {err} during <{state}>; tearing down"
+                    );
                     break;
                 }
             }
@@ -1208,7 +1214,10 @@ unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
         }
     }
 
-    eprintln!("[peer_mainloop] teardown: mainloop exit after {} iters", iter);
+    eprintln!(
+        "[peer_mainloop] teardown: mainloop exit after {} iters",
+        iter
+    );
     // Drop the capture session FIRST, before any FreeRDP teardown. Neither
     // frame_rx nor session touches a FreeRDP object, so this must not wait
     // behind Disconnect()/context_free. Closing the session's cmd channel

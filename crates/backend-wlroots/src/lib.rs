@@ -127,7 +127,10 @@ fn current_hyprland_signature() -> Option<String> {
 /// A short connect is the only honest liveness test.
 fn socket_live(rt: &std::ffi::OsStr, sig: &str) -> bool {
     let Some(rt) = rt.to_str() else { return false };
-    let path = std::path::PathBuf::from(rt).join("hypr").join(sig).join(".socket.sock");
+    let path = std::path::PathBuf::from(rt)
+        .join("hypr")
+        .join(sig)
+        .join(".socket.sock");
     if !path.exists() {
         return false;
     }
@@ -167,7 +170,11 @@ fn hyprctl_run(args: &[&str]) -> std::io::Result<std::process::Output> {
     let out = hyprctl().args(args).output();
     let ms = start.elapsed().as_millis();
     if ms > 2000 {
-        eprintln!("[backend-wlroots] hyprctl {} took {} ms", args.join(" "), ms);
+        eprintln!(
+            "[backend-wlroots] hyprctl {} took {} ms",
+            args.join(" "),
+            ms
+        );
     }
     out
 }
@@ -1115,8 +1122,7 @@ fn output_hz() -> u32 {
 
 /// Create a `wayrdp-*` headless output at the requested size.
 fn create_headless_output(size: Size, name: &str, scale: f64) {
-    match hyprctl_run(&["output", "create", "headless", name]).map(|o| o.status)
-    {
+    match hyprctl_run(&["output", "create", "headless", name]).map(|o| o.status) {
         Ok(s) if s.success() => {
             // Hyprland >= 0.50 rejects `keyword` for monitor (non-legacy
             // parser). `output create headless` auto-picks a default mode; pin
@@ -2484,7 +2490,12 @@ fn pump_loop(
             // async post-create default-mode assignment and can lose, leaving
             // the output at its realized default instead of the negotiated
             // size (pointer drift). converge on the client size here.
-            repin_output_mode(&state.output_name, state.frame_size, state.output_scale, output_hz());
+            repin_output_mode(
+                &state.output_name,
+                state.frame_size,
+                state.output_scale,
+                output_hz(),
+            );
             // Post-settle re-sync (see startup note): the mode pin applied
             // during create_headless_output lands asynchronously, so the
             // pre-settle sync_layout above may hold a stale extent.
@@ -2647,7 +2658,12 @@ fn pump_loop(
             // Re-pin the mode after settle (same create-time race as the shm
             // pump / startup paths): without it the recreated output can hold
             // the default mode and produce a size-mismatch capture retry loop.
-            repin_output_mode(&state.output_name, state.frame_size, state.output_scale, output_hz());
+            repin_output_mode(
+                &state.output_name,
+                state.frame_size,
+                state.output_scale,
+                output_hz(),
+            );
             sync_layout(&mut state);
             if bind_capture(&mut state, &mut event_queue).is_err() {
                 eprintln!("[backend-wlroots] capture retry rebind failed");
