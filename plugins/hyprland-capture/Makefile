@@ -5,14 +5,17 @@
 # Hyprland ships no stable C++ ABI — we must match its compiler.
 #
 # Hooks Hyprland's per-monitor RENDER_LAST_MOMENT on wayrdp-* headless
-# outputs and glReadPixels the painted framebuffer into a /dev/shm segment
-# (/dev/shm/wayrdp-capture-<name>, seqlock header + BGRA pixels) that the
-# backend-wlroots shm pump (WAYRDP_CAPTURE=shm-plugin) consumes.
+# outputs and glReadPixels the painted framebuffer into a tmpfs segment
+# ($XDG_RUNTIME_DIR/wayrdp-capture-<name>, seqlock header + BGRA pixels)
+# that the backend-wlroots shm pump (WAYRDP_CAPTURE=shm-plugin) consumes.
+# The runtime dir is 0700 user-owned, so no other local user can pre-create
+# the segment name.
 #
 # WARNING: never hot-reload (hyprctl plugin unload/load) while wayrdp has
 # peers — pluginExit teardown races an in-flight render frame and SIGSEGVs
 # the compositor into --safe-mode --locked (observed 2026-10-10). Upgrade
-# the .so at logout/reboot; wayrdp falls back to ext-image-copy if absent.
+# the .so at logout/reboot. Sessions only use this path with
+# WAYRDP_CAPTURE=shm-plugin; without that, wayrdp uses ext-image-copy.
 
 CXX      ?= g++
 CXX_SRCS := main.cpp
