@@ -27,6 +27,8 @@
 #include <freerdp/channels/wtsvc.h>
 #include <freerdp/server/rdpgfx.h>
 #include <freerdp/server/disp.h>
+#include <freerdp/channels/cliprdr.h>
+#include <freerdp/server/cliprdr.h>
 #include <freerdp/codec/rfx.h>
 #include <freerdp/codec/color.h>
 #include <winpr/input.h>
@@ -416,6 +418,109 @@ mon.flags = 0x1;
  * reader thread; Caps advertises our limits so clients send layouts. */
 UINT wayrdp_disp_call_open(DispServerContext* c) { return c->Open(c); }
 UINT wayrdp_disp_call_caps(DispServerContext* c) { return c->DisplayControlCaps(c); }
+
+/* CLIPRDR (MS-RDPECLIP) server context. A static channel: the client joins
+ * it during MCS connect, so it is started from post_connect (shadow does the
+ * same). Start() opens the channel and spawns the channel's own reader
+ * thread, which sends Capabilities + MonitorReady first
+ * (autoInitializationSequence) and then runs the Client* callbacks. The
+ * Server* senders below go through the VCM's locked write path and may be
+ * called from any thread. Same bindgen limitation as rdpgfx/disp: wrap the
+ * ops-table calls. */
+const char* wayrdp_cliprdr_channel_name(void) { return CLIPRDR_SVC_CHANNEL_NAME; }
+
+CliprdrServerContext* wayrdp_cliprdr_new(HANDLE vcm, void* rdpctx)
+{
+	CliprdrServerContext* c = cliprdr_server_context_new(vcm);
+	if (!c)
+		return NULL;
+	c->rdpcontext = (rdpContext*)rdpctx;
+	c->useLongFormatNames = TRUE;
+	/* File transfer as streams (FileContents) with names only, no paths. */
+	c->streamFileClipEnabled = TRUE;
+	c->fileClipNoFilePaths = TRUE;
+	c->canLockClipData = FALSE;
+	c->hasHugeFileSupport = TRUE;
+	return c;
+}
+
+UINT wayrdp_cliprdr_start(CliprdrServerContext* c) { return c->Start(c); }
+UINT wayrdp_cliprdr_stop(CliprdrServerContext* c) { return c->Stop(c); }
+
+UINT wayrdp_cliprdr_send_format_list(CliprdrServerContext* c, const UINT32* ids,
+                                     const char* const* names, UINT32 n)
+{
+	CLIPRDR_FORMAT* formats = calloc(n ? n : 1, sizeof(CLIPRDR_FORMAT));
+	if (!formats)
+		return ERROR_OUTOFMEMORY;
+	for (UINT32 i = 0; i < n; i++)
+	{
+		formats[i].formatId = ids[i];
+		formats[i].formatName = (char*)names[i]; /* NULL for standard formats */
+	}
+	CLIPRDR_FORMAT_LIST list = { 0 };
+	list.common.msgType = CB_FORMAT_LIST;
+	list.numFormats = n;
+	list.formats = formats;
+	UINT rc = c->ServerFormatList(c, &list);
+	free(formats);
+	return rc;
+}
+
+UINT wayrdp_cliprdr_send_format_list_response(CliprdrServerContext* c, BOOL ok)
+{
+	CLIPRDR_FORMAT_LIST_RESPONSE r = { 0 };
+	r.common.msgType = CB_FORMAT_LIST_RESPONSE;
+	r.common.msgFlags = ok ? CB_RESPONSE_OK : CB_RESPONSE_FAIL;
+	return c->ServerFormatListResponse(c, &r);
+}
+
+UINT wayrdp_cliprdr_send_data_request(CliprdrServerContext* c, UINT32 format_id)
+{
+	CLIPRDR_FORMAT_DATA_REQUEST r = { 0 };
+	r.common.msgType = CB_FORMAT_DATA_REQUEST;
+	r.requestedFormatId = format_id;
+	return c->ServerFormatDataRequest(c, &r);
+}
+
+UINT wayrdp_cliprdr_send_data_response(CliprdrServerContext* c, BOOL ok, const BYTE* data,
+                                       UINT32 len)
+{
+	CLIPRDR_FORMAT_DATA_RESPONSE r = { 0 };
+	r.common.msgType = CB_FORMAT_DATA_RESPONSE;
+	r.common.msgFlags = ok ? CB_RESPONSE_OK : CB_RESPONSE_FAIL;
+	r.common.dataLen = ok ? len : 0;
+	r.requestedFormatData = ok ? data : NULL;
+	return c->ServerFormatDataResponse(c, &r);
+}
+
+UINT wayrdp_cliprdr_send_file_contents_request(CliprdrServerContext* c, UINT32 stream_id,
+                                               UINT32 list_index, UINT32 flags,
+                                               UINT64 position, UINT32 cb_requested)
+{
+	CLIPRDR_FILE_CONTENTS_REQUEST r = { 0 };
+	r.common.msgType = CB_FILECONTENTS_REQUEST;
+	r.streamId = stream_id;
+	r.listIndex = list_index;
+	r.dwFlags = flags;
+	r.nPositionLow = (UINT32)(position & 0xFFFFFFFF);
+	r.nPositionHigh = (UINT32)(position >> 32);
+	r.cbRequested = cb_requested;
+	return c->ServerFileContentsRequest(c, &r);
+}
+
+UINT wayrdp_cliprdr_send_file_contents_response(CliprdrServerContext* c, UINT32 stream_id,
+                                                BOOL ok, const BYTE* data, UINT32 len)
+{
+	CLIPRDR_FILE_CONTENTS_RESPONSE r = { 0 };
+	r.common.msgType = CB_FILECONTENTS_RESPONSE;
+	r.common.msgFlags = ok ? CB_RESPONSE_OK : CB_RESPONSE_FAIL;
+	r.common.dataLen = ok ? 4 + len : 4;
+	r.streamId = stream_id;
+	r.cbRequested = ok ? len : 0;
+	r.requestedData = ok ? data : NULL;
+	return c->ServerFileContentsResponse(c, &r);
+}
 
 /* F1: RDP->evdev scancode conversion via WinPR's key tables. The wlroots
  * virtual keyboard must not simply subtract 8 from the RDP scancode — that

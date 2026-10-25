@@ -6,6 +6,7 @@ members = [
     "crates/rdp-core",
     "crates/backend-kde",
     "crates/backend-wlroots",
+    "crates/clipboard-wayland",
     "server",
 ]
 

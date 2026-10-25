@@ -7,6 +7,10 @@
 
 pub mod synthetic;
 
+#[cfg(unix)]
+pub mod clipformat;
+#[cfg(freerdp_present)]
+pub mod cliprdr;
 #[cfg(freerdp_present)]
 pub mod consts;
 #[cfg(freerdp_present)]
@@ -89,6 +93,8 @@ impl Server {
         // The closure is Arc'd because each accepted peer needs to reopen
         // the same backend; `self` is consumed by `run`.
         let backend = std::sync::Arc::new(self.backend);
+        let clip_backend = std::sync::Arc::clone(&backend);
+        let open_clipboard = move || clip_backend.open_clipboard();
         let open_session = move |req: SessionRequest| -> Option<Box<dyn CaptureSession>> {
             match backend.open(req) {
                 Ok(s) => Some(s),
@@ -103,6 +109,7 @@ impl Server {
             cert_path: cert_c,
             key_path: key_c,
             open_session: Box::new(open_session),
+            open_clipboard: Box::new(open_clipboard),
             vsock_allow: self.vsock_allow,
             sam_path: sam_c,
         });

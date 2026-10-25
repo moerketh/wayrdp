@@ -8,6 +8,9 @@ description = "wayrdp wlroots-class backend (Hyprland/Sway): headless virtual ou
 
 [dependencies]
 desk-backend = { path = "../desk-backend" }
+# Session clipboard (wlr-data-control); compositor-agnostic, shared with
+# any backend whose compositor implements the protocol.
+clipboard-wayland = { path = "../clipboard-wayland" }
 # RDP scancode → evdev keycode via WinPR's VK tables (F1). On non-freerdp
 # builds this crate compiles a stub and the legacy -8 map is used.
 freerdp-sys = { path = "../freerdp-sys" }

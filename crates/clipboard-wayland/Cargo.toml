@@ -1,0 +1,16 @@
+[package]
+name = "clipboard-wayland"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wayrdp session clipboard over wlr-data-control (Hyprland, Sway, KDE)"
+
+[dependencies]
+desk-backend = { path = "../desk-backend" }
+# Same wayland-client line as backend-wlroots (one version per lockfile).
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+crossbeam-channel = "0.5.17"
+libc = "0.2"
+anyhow = "1"

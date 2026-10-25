@@ -54,6 +54,10 @@ pub struct PeerContext {
     /// calloc can't construct this — ptr::write in peer_context_new,
     /// drop_in_place in peer_context_free.
     pub disp_req: std::sync::Mutex<Option<Size>>,
+    /// Clipboard redirection (cliprdr static channel); None unless the
+    /// client joined the channel and the backend offers a clipboard.
+    /// calloc-zero is a valid None; dropped before the VCM closes.
+    pub cliprdr: Option<Box<crate::cliprdr::Cliprdr>>,
     /// RemoteFX encoder for the current gfx surface; recreated with it.
     /// Owned via the freerdp-sys shim (RFX_CONTEXT + one reusable wStream).
     pub rfx: *mut WayrdpRfx,
@@ -121,6 +125,14 @@ pub struct PeerContext {
     /// Last raw value read from `pointer_pos_slot`; used to only emit
     /// PTR_POS_UPDATE on change.
     pub pointer_pos_last: u64,
+    /// Client-drawn cursor (WAYRDP_CLIENT_CURSOR): the backend publishes the
+    /// compositor's cursor image here and leaves it out of the frames; the
+    /// mainloop sends it as the client's pointer shape. None = the cursor is
+    /// painted in the video behind a transparent client pointer.
+    pub cursor_slot: Option<desk_backend::PointerShapeSlot>,
+    /// Last cursor state taken from `cursor_slot`, re-sent whenever the
+    /// client's pointer state resets (activation, EGFX reset).
+    pub cursor_last: Option<desk_backend::CursorUpdate>,
     /// Live capture session; kept for resize/inject once D4/D5 need them.
     pub session: Option<Box<dyn CaptureSession>>,
     pub width: UINT32,
@@ -141,6 +153,8 @@ pub struct ServerState {
     pub cert_path: CString,
     pub key_path: CString,
     pub open_session: Box<dyn Fn(SessionRequest) -> Option<Box<dyn CaptureSession>> + Send + Sync>,
+    /// The backend's session clipboard, opened per peer (None = no cliprdr).
+    pub open_clipboard: Box<dyn Fn() -> Option<Box<dyn desk_backend::Clipboard>> + Send + Sync>,
     /// Allowed peer CIDs for vsock connections (empty = any). Only checked
     /// for AF_VSOCK peers; TCP peers bypass it entirely.
     pub vsock_allow: Vec<u32>,
@@ -510,10 +524,13 @@ unsafe fn peer_context_new_inner(ctx: *mut rdpContext) -> BOOL {
     ptr::write(&mut (*ctx).frame_rx, None);
     ptr::write(&mut (*ctx).pointer_pos_slot, None);
     (*ctx).pointer_pos_last = 0;
+    ptr::write(&mut (*ctx).cursor_slot, None);
+    ptr::write(&mut (*ctx).cursor_last, None);
     (*ctx).damage_full_frames = 0;
     ptr::write(&mut (*ctx).prev_frame_pixels, None);
     ptr::write(&mut (*ctx).pending_ack, None);
     ptr::write(&mut (*ctx).disp_req, std::sync::Mutex::new(None));
+    ptr::write(&mut (*ctx).cliprdr, None);
     // Plain scalars / thin handles.
     (*ctx).peer = ptr::null_mut();
     (*ctx).vcm = ptr::null_mut();
@@ -551,6 +568,8 @@ unsafe fn peer_context_free_inner(ctx: *mut rdpContext) {
     // Teardown timeline: context teardown begins. rdpgfx borrows the VCM
     // handle; free it (and the RFX encoder) first.
     eprintln!("[peer_context_free_inner] teardown: context_free start");
+    // cliprdr: Stop joins its channel thread; must precede the VCM close.
+    (*ctx).cliprdr = None;
     if !(*ctx).rdpgfx.is_null() {
         wayrdp_rdpgfx_call_close((*ctx).rdpgfx);
         rdpgfx_server_context_free((*ctx).rdpgfx);
@@ -572,6 +591,8 @@ unsafe fn peer_context_free_inner(ctx: *mut rdpContext) {
     }
     (*ctx).frame_rx = None;
     (*ctx).pointer_pos_slot = None;
+    (*ctx).cursor_slot = None;
+    (*ctx).cursor_last = None;
     // Dropping the capture session closes its cmd channel -> pump loop notices
     // and tears down its headless output; the pump's timeline continues in
     // backend-wlroots under "teardown wayrdp-N:".
@@ -691,8 +712,27 @@ unsafe fn peer_post_connect_inner(client: *mut rdp_freerdp_peer) -> BOOL {
     // visible effect on mstsc/vmconnect, while FreeRDP clients WARP THE
     // LOCAL CURSOR on PTR_POS_UPDATE: echoing injected motion back at wire
     // latency makes the xfreerdp cursor fight the user's hand.
+    // Client-drawn cursor (WAYRDP_CLIENT_CURSOR): the client draws the
+    // compositor's cursor image itself, so the pointer moves at local speed
+    // and the video carries no cursor (no lag trail, no second pointer).
+    // Off by default until the T4 pointer tests pass on vmconnect.
+    let cursor_slot: Option<desk_backend::PointerShapeSlot> =
+        if std::env::var_os("WAYRDP_CLIENT_CURSOR").is_some() {
+            let slot: desk_backend::PointerShapeSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            if session.set_pointer_shape_slot(slot.clone()) {
+                eprintln!("[peer_post_connect] client-drawn cursor on");
+                Some(slot)
+            } else {
+                eprintln!("[peer_post_connect] backend cannot deliver cursor images; cursor stays painted");
+                None
+            }
+        } else {
+            None
+        };
+    // No position echo with a client-drawn cursor: the client already moves
+    // its own pointer, and FreeRDP clients warp on every PTR_POS_UPDATE.
     let pos_slot: Option<desk_backend::PointerPositionSlot> =
-        if std::env::var_os("WAYRDP_POINTER_METADATA").is_some() {
+        if cursor_slot.is_none() && std::env::var_os("WAYRDP_POINTER_METADATA").is_some() {
             let slot: desk_backend::PointerPositionSlot =
                 std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             session.set_pointer_position_slot(slot.clone());
@@ -724,6 +764,7 @@ unsafe fn peer_post_connect_inner(client: *mut rdp_freerdp_peer) -> BOOL {
     (*ctx).session = Some(session);
     (*ctx).frame_rx = Some(rx);
     (*ctx).pointer_pos_slot = pos_slot;
+    (*ctx).cursor_slot = cursor_slot;
     eprintln!("[peer_post_connect] session started ok");
 
     // F3: slow-path frame back-pressure is released by SurfaceFrameAcknowledge
@@ -787,6 +828,19 @@ unsafe fn peer_post_connect_inner(client: *mut rdp_freerdp_peer) -> BOOL {
             eprintln!("[peer_post_connect] disp created; Open deferred to drdynvc ready");
         }
     }
+
+    // Clipboard (MS-RDPECLIP) rides the cliprdr STATIC channel, joined at
+    // connect time, so it starts here — no drdynvc wait. Shadow does the
+    // same in its post_connect.
+    if wayrdp_vcm_is_channel_joined((*ctx).vcm, wayrdp_cliprdr_channel_name()) != 0 {
+        match (state.open_clipboard)() {
+            Some(clipboard) => {
+                (*ctx).cliprdr =
+                    crate::cliprdr::Cliprdr::start((*ctx).vcm, ctx as *mut rdpContext, clipboard);
+            }
+            None => eprintln!("[peer_post_connect] backend offers no clipboard; cliprdr not served"),
+        }
+    }
     1
 }
 
@@ -798,7 +852,7 @@ unsafe extern "C" fn peer_activate(client: *mut rdp_freerdp_peer) -> BOOL {
         // First-send + re-send cadence: the client's pointer state resets on
         // EGFX reset / resize, so the transparent shape must go out after
         // activation and again from the frame loop.
-        if !pointer::send_transparent_pointer((*ctx).base.update, ctx as *mut rdpContext) {
+        if !send_pointer_state(ctx, (*ctx).base.update) {
             (*ctx).pointer_resend = true;
         }
         1
@@ -920,6 +974,85 @@ unsafe fn apply_disp_resize(ctx: *mut PeerContext) {
     }
 }
 
+/// Outcome of the mainloop's `recv(MSG_PEEK | MSG_DONTWAIT)` EOF probe.
+#[derive(Debug, PartialEq, Eq)]
+enum EofPeek {
+    /// Data pending or merely idle (EAGAIN/EINTR): the peer is alive.
+    Alive,
+    /// Orderly shutdown: a 0-byte read on a stream socket.
+    Eof,
+    /// The transport cannot peek. hv_sock (the Hyper-V vsock transport
+    /// vmconnect uses) has no way to peek its ring buffer and fails MSG_PEEK
+    /// with EOPNOTSUPP whenever data is pending — a healthy, busy socket.
+    /// Treating it as an error dropped live sessions within seconds at
+    /// 1920x1200; ask [`socket_hung_up`] instead.
+    PeekUnsupported,
+    /// A hard socket error.
+    Error(i32),
+}
+
+fn eof_peek_verdict(r: isize, err: i32) -> EofPeek {
+    if r > 0 {
+        EofPeek::Alive
+    } else if r == 0 {
+        EofPeek::Eof
+    } else if err == libc::EOPNOTSUPP {
+        EofPeek::PeekUnsupported
+    } else if err == libc::EAGAIN || err == libc::EWOULDBLOCK || err == libc::EINTR {
+        EofPeek::Alive
+    } else {
+        EofPeek::Error(err)
+    }
+}
+
+/// Non-blocking hangup check that never reads: vsock reports a peer
+/// shutdown as POLLRDHUP/POLLHUP, and pending data alone sets neither.
+fn socket_hung_up(fd: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, zero timeout.
+    let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+    n > 0 && pfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
+}
+
+#[cfg(test)]
+mod eof_probe_tests {
+    use super::*;
+
+    #[test]
+    fn peek_unsupported_is_not_a_socket_error() {
+        // Regression: hv_sock's EOPNOTSUPP tore down live vmconnect sessions.
+        assert_eq!(eof_peek_verdict(-1, libc::EOPNOTSUPP), EofPeek::PeekUnsupported);
+    }
+
+    #[test]
+    fn peek_verdicts() {
+        assert_eq!(eof_peek_verdict(1, 0), EofPeek::Alive);
+        assert_eq!(eof_peek_verdict(0, 0), EofPeek::Eof);
+        assert_eq!(eof_peek_verdict(-1, libc::EAGAIN), EofPeek::Alive);
+        assert_eq!(eof_peek_verdict(-1, libc::EINTR), EofPeek::Alive);
+        assert_eq!(eof_peek_verdict(-1, libc::ECONNRESET), EofPeek::Error(libc::ECONNRESET));
+    }
+
+    #[test]
+    fn hangup_check_ignores_pending_data_and_sees_peer_close() {
+        let mut fds = [0i32; 2];
+        // SAFETY: plain socketpair/write/close on fds owned by this test.
+        unsafe {
+            assert_eq!(libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()), 0);
+            assert!(!socket_hung_up(fds[0]), "idle, open peer");
+            assert_eq!(libc::write(fds[1], b"x".as_ptr() as *const libc::c_void, 1), 1);
+            assert!(!socket_hung_up(fds[0]), "pending data from an open peer is not a hangup");
+            libc::close(fds[1]);
+            assert!(socket_hung_up(fds[0]), "peer closed");
+            libc::close(fds[0]);
+        }
+    }
+}
+
 unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
     eprintln!("[peer_mainloop] enter");
     let mut iter: u32 = 0;
@@ -1032,15 +1165,20 @@ unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
             } else {
                 "activating"
             };
-            // Only an orderly shutdown (clean 0) or a hard socket error is
-            // terminal. EAGAIN means "no data right now" — the peer is merely
-            // idle, NOT closed, so never treat it as EOF.
-            if r == 0 {
-                eprintln!("[peer_mainloop] client closed connection during <{state}> (EOF on readable socket); tearing down");
-                break;
-            } else if r < 0 {
-                let err = *libc::__errno_location();
-                if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
+            let err = if r < 0 { *libc::__errno_location() } else { 0 };
+            match eof_peek_verdict(r, err) {
+                EofPeek::Alive => {}
+                EofPeek::Eof => {
+                    eprintln!("[peer_mainloop] client closed connection during <{state}> (EOF on readable socket); tearing down");
+                    break;
+                }
+                EofPeek::PeekUnsupported => {
+                    if socket_hung_up((*ctx).peer_fd) {
+                        eprintln!("[peer_mainloop] client closed connection during <{state}> (vsock hangup); tearing down");
+                        break;
+                    }
+                }
+                EofPeek::Error(err) => {
                     eprintln!(
                         "[peer_mainloop] peer socket error {err} during <{state}>; tearing down"
                     );
@@ -1151,6 +1289,20 @@ unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
                 }
             }
 
+            // Client-drawn cursor: forward the newest shape (or hide) as soon
+            // as the backend publishes it; shapes change rarely.
+            let cursor_next = (*ctx)
+                .cursor_slot
+                .as_ref()
+                .and_then(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()).take());
+            if let Some(next) = cursor_next {
+                (*ctx).cursor_last = Some(next);
+                let update = (*ctx).base.update;
+                if !update.is_null() && !send_pointer_state(ctx, update) {
+                    (*ctx).pointer_resend = true;
+                }
+            }
+
             // Drain all queued frames and only send the last one. F9: when
             // the backend capture pipeline dies, its sender is dropped and
             // try_iter would spin on an empty, dead channel forever — a
@@ -1256,6 +1408,21 @@ unsafe extern "C" fn peer_surface_frame_acknowledge(context: *mut rdpContext, ac
     }
 }
 
+/// (Re-)assert the client's pointer: the compositor's cursor image in
+/// client-drawn mode, otherwise (or when hidden, or when the client cannot
+/// take a 32 bpp shape) the transparent shape over the painted cursor.
+///
+/// # Safety
+/// `ctx` must be the live peer context and `update` its `rdpUpdate`.
+unsafe fn send_pointer_state(ctx: *mut PeerContext, update: *mut rdpUpdate) -> bool {
+    if let Some(desk_backend::CursorUpdate::Shape(img)) = (*ctx).cursor_last.as_ref() {
+        if pointer::send_cursor_image(update, ctx as *mut rdpContext, img) {
+            return true;
+        }
+    }
+    pointer::send_transparent_pointer(update, ctx as *mut rdpContext)
+}
+
 fn send_frame(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext, frame: &Frame) {
     unsafe {
         if (*ctx).pending_ack.is_some() {
@@ -1267,7 +1434,7 @@ fn send_frame(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext, frame: &Fram
             return;
         }
         if (*ctx).activated && (*ctx).pointer_resend {
-            pointer::send_transparent_pointer(update, ctx as *mut rdpContext);
+            send_pointer_state(ctx, update);
             (*ctx).pointer_resend = false;
         }
         let Some(surface_bits) = (*update).SurfaceBits else {
@@ -1615,7 +1782,7 @@ fn send_frame_gfx(ctx: *mut PeerContext, frame: &Frame) {
             // EGFX ResetGraphics clears client pointer state; re-send the
             // transparent shape after the surface is back.
             if (*ctx).activated && !(*ctx).base.update.is_null() {
-                if !pointer::send_transparent_pointer((*ctx).base.update, ctx as *mut rdpContext) {
+                if !send_pointer_state(ctx, (*ctx).base.update) {
                     (*ctx).pointer_resend = true;
                 }
             }

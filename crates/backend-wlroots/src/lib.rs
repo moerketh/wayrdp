@@ -44,6 +44,9 @@ use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_c
     self, ExtOutputImageCaptureSourceManagerV1,
 };
 use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_cursor_session_v1::{
+    self, ExtImageCopyCaptureCursorSessionV1,
+};
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_frame_v1::{
     self, ExtImageCopyCaptureFrameV1,
 };
@@ -268,6 +271,10 @@ impl DesktopBackend for WlrBackend {
         let prefs = WlSessionPrefs::from_request(&req);
         Ok(Box::new(WlrCaptureSession::new(even(initial), prefs)))
     }
+
+    fn open_clipboard(&self) -> Option<Box<dyn desk_backend::Clipboard>> {
+        Some(Box::new(clipboard_wayland::WlClipboard::new()))
+    }
 }
 
 /// Per-client presentation prefs carried from `SessionRequest` into the
@@ -394,6 +401,9 @@ pub struct WlrCaptureSession {
     /// mainloop's WinPR wait set so a new frame is encoded immediately
     /// instead of at the next 16ms poll tick. None until rdp-core installs.
     frame_wake: Mutex<Option<desk_backend::FrameWake>>,
+    /// Client-drawn-cursor slot (WAYRDP_CLIENT_CURSOR), taken by the pump at
+    /// start(). Set = capture the cursor separately instead of painting it.
+    cursor_slot: Mutex<Option<desk_backend::PointerShapeSlot>>,
 }
 
 impl WlrCaptureSession {
@@ -407,6 +417,7 @@ impl WlrCaptureSession {
             prefs,
             input_wake_fd: Mutex::new(None),
             frame_wake: Mutex::new(None),
+            cursor_slot: Mutex::new(None),
         }
     }
 
@@ -469,6 +480,11 @@ impl CaptureSession for WlrCaptureSession {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
+        let cursor_slot = self
+            .cursor_slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         let prefs = WlSessionPrefs {
             kbd_layout: self.prefs.kbd_layout.clone(),
             kbd_variant: self.prefs.kbd_variant.clone(),
@@ -493,6 +509,7 @@ impl CaptureSession for WlrCaptureSession {
                     prefs,
                     wake_fd,
                     frame_wake,
+                    cursor_slot,
                 )
             })
             .map_err(|e| BackendError::Other(anyhow::anyhow!("spawn capture thread: {e}")))?;
@@ -528,6 +545,18 @@ impl CaptureSession for WlrCaptureSession {
     /// wait returns immediately; no hook = the old 16ms poll cadence.
     fn set_frame_wake(&mut self, wake: desk_backend::FrameWake) {
         *self.frame_wake.lock().unwrap_or_else(|p| p.into_inner()) = Some(wake);
+    }
+
+    /// Client-drawn cursor: the ext-image-copy pump captures the cursor
+    /// through a pointer cursor session and stops painting it into frames.
+    /// The shm-plugin capture path has no cursor session, so it declines and
+    /// keeps the painted cursor.
+    fn set_pointer_shape_slot(&mut self, slot: desk_backend::PointerShapeSlot) -> bool {
+        if std::env::var("WAYRDP_CAPTURE").is_ok_and(|v| v == "shm-plugin") {
+            return false;
+        }
+        *self.cursor_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(slot);
+        true
     }
 }
 
@@ -640,6 +669,10 @@ struct State {
     /// rdp-core can forward it as `PTR_POS_UPDATE`. `None` means the client
     /// sees the cursor painted in the video (Painted mode).
     pointer_pos_slot: Option<desk_backend::PointerPositionSlot>,
+    /// The seat advertises the pointer capability: wl_seat.get_pointer is a
+    /// protocol error otherwise, and a cursor session needs a wl_pointer.
+    seat_pointer: bool,
+    cursor: CursorCapture,
 }
 
 impl Default for State {
@@ -680,6 +713,334 @@ impl Default for State {
             layout_extent: (0, 0),
             layout_origin: (0, 0),
             pointer_pos_slot: None,
+            seat_pointer: false,
+            cursor: CursorCapture::default(),
+        }
+    }
+}
+
+/// Minimum spacing between cursor captures. The compositor may hold a cursor
+/// frame until the image changes, but nothing obliges it to: this caps an
+/// eager compositor at ~30 captures/s of a tiny buffer.
+const CURSOR_CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// User data of the cursor's capture session and frames, so their events
+/// stay apart from the output capture's (user data `()`).
+struct CursorTag;
+
+/// Client-drawn cursor (WAYRDP_CLIENT_CURSOR): a pointer cursor session on
+/// our output's capture source. The output session is then created without
+/// PaintCursors, and the cursor image copied here is published to rdp-core,
+/// which sends it as the client's pointer shape. Without a slot (or when the
+/// session cannot be created) the cursor stays painted in the video.
+#[derive(Default)]
+struct CursorCapture {
+    slot: Option<desk_backend::PointerShapeSlot>,
+    pointer: Option<wl_pointer::WlPointer>,
+    cursor_session: Option<ExtImageCopyCaptureCursorSessionV1>,
+    session: Option<ExtImageCopyCaptureSessionV1>,
+    /// The frame in flight; at most one per session.
+    frame: Option<ExtImageCopyCaptureFrameV1>,
+    size: Option<Size>,
+    fmt: Option<wl_shm::Format>,
+    pool: Option<(ShmBuffer, Size, wl_shm::Format)>,
+    ready: bool,
+    failed: bool,
+    stopped: bool,
+    /// The cursor image intersects our output.
+    inside: bool,
+    hotspot: (i32, i32),
+    next_capture: Option<std::time::Instant>,
+    failures: u32,
+    last: Option<desk_backend::CursorUpdate>,
+}
+
+impl CursorCapture {
+    /// Release the cursor session and its in-flight frame. Called before the
+    /// capture source or our output goes away: an output removed under a
+    /// live frame aborts Hyprland (see claim_pump).
+    fn release_session(&mut self) {
+        if let Some(f) = self.frame.take() {
+            f.destroy();
+        }
+        if let Some(s) = self.session.take() {
+            s.destroy();
+        }
+        if let Some(c) = self.cursor_session.take() {
+            c.destroy();
+        }
+        self.size = None;
+        self.fmt = None;
+        self.pool = None;
+        self.ready = false;
+        self.failed = false;
+        self.stopped = false;
+        self.inside = false;
+        self.next_capture = None;
+        self.failures = 0;
+    }
+
+    /// Create the cursor session on `source`. Returns false (cursor stays
+    /// painted) without a slot, without a pointer-capable seat, or without
+    /// the protocol.
+    fn bind(
+        &mut self,
+        state_seat: Option<&wl_seat::WlSeat>,
+        seat_pointer: bool,
+        capture_mgr: &ExtImageCopyCaptureManagerV1,
+        source: &ExtImageCaptureSourceV1,
+        qh: &QueueHandle<State>,
+    ) -> bool {
+        self.release_session();
+        if self.slot.is_none() {
+            return false;
+        }
+        let Some(seat) = state_seat.filter(|_| seat_pointer) else {
+            eprintln!("[backend-wlroots] client cursor: seat has no pointer; cursor stays painted");
+            return false;
+        };
+        let pointer = self
+            .pointer
+            .get_or_insert_with(|| seat.get_pointer(qh, ()))
+            .clone();
+        let cursor_session = capture_mgr.create_pointer_cursor_session(source, &pointer, qh, ());
+        self.session = Some(cursor_session.get_capture_session(qh, CursorTag));
+        self.cursor_session = Some(cursor_session);
+        true
+    }
+
+    /// Publish `update` when it differs from what the client has. Returns
+    /// true when something was published.
+    fn publish(&mut self, update: desk_backend::CursorUpdate) -> bool {
+        if self.last.as_ref() == Some(&update) {
+            return false;
+        }
+        if let Some(slot) = &self.slot {
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(update.clone());
+        }
+        if std::env::var_os("WAYRDP_DEBUG_CURSOR").is_some() {
+            match &update {
+                desk_backend::CursorUpdate::Shape(img) => eprintln!(
+                    "[backend-wlroots] cursor shape {}x{} hot {},{}",
+                    img.width, img.height, img.hot_x, img.hot_y
+                ),
+                desk_backend::CursorUpdate::Hidden => eprintln!("[backend-wlroots] cursor hidden"),
+            }
+        }
+        self.last = Some(update);
+        true
+    }
+
+    /// One pump-loop step: turn a ready frame into a shape, recover from a
+    /// failed one, and keep one capture in flight while the cursor is on our
+    /// output. Returns true when a new cursor state was published.
+    fn service(&mut self, shm: &wl_shm::WlShm, qh: &QueueHandle<State>) -> bool {
+        let Some(session) = self.session.clone() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let mut published = false;
+
+        if self.stopped {
+            // The compositor ended the session (no cursor can be captured any
+            // more). Nothing paints the cursor now, so hide the client one
+            // rather than leave a stale shape.
+            eprintln!("[backend-wlroots] client cursor: session stopped");
+            self.release_session();
+            return self.publish(desk_backend::CursorUpdate::Hidden);
+        }
+        if self.ready {
+            self.ready = false;
+            self.failures = 0;
+            if let Some((pool, size, fmt)) = &self.pool {
+                let img = cursor_image_from_shm(&pool.read_pixels(), *size, *fmt, self.hotspot);
+                published |= self.publish(desk_backend::CursorUpdate::Shape(Arc::new(img)));
+            }
+            self.next_capture = Some(now + CURSOR_CAPTURE_INTERVAL);
+        }
+        if self.failed {
+            // Usually new buffer constraints (the cursor image changed size):
+            // reallocate on the next capture, backing off if it keeps failing.
+            self.failed = false;
+            self.pool = None;
+            self.failures = self.failures.saturating_add(1);
+            self.next_capture = Some(now + CURSOR_CAPTURE_INTERVAL * self.failures.min(30));
+        }
+        if !self.inside {
+            if self.last.is_some() {
+                published |= self.publish(desk_backend::CursorUpdate::Hidden);
+            }
+            return published;
+        }
+        if self.frame.is_some() || self.next_capture.is_some_and(|t| now < t) {
+            return published;
+        }
+        let (Some(size), Some(fmt)) = (self.size, self.fmt) else {
+            return published;
+        };
+        if size.width == 0 || size.height == 0 {
+            return published;
+        }
+        if self
+            .pool
+            .as_ref()
+            .is_none_or(|(_, s, f)| *s != size || *f != fmt)
+        {
+            self.pool = match ShmBuffer::create(shm, qh, size, fmt) {
+                Ok(p) => Some((p, size, fmt)),
+                Err(e) => {
+                    eprintln!("[backend-wlroots] client cursor: shm alloc failed: {e}");
+                    self.failed = true;
+                    return published;
+                }
+            };
+        }
+        if let Some((pool, _, _)) = &self.pool {
+            let frame = session.create_frame(qh, CursorTag);
+            frame.attach_buffer(&pool.buffer);
+            frame.capture();
+            self.frame = Some(frame);
+        }
+        published
+    }
+
+    /// How long the pump may sleep before the next cursor capture is due.
+    fn wait_ms(&self) -> Option<i32> {
+        if self.session.is_none() || !self.inside || self.frame.is_some() {
+            return None;
+        }
+        let due = self.next_capture?;
+        let left = due.saturating_duration_since(std::time::Instant::now());
+        Some(left.as_millis().min(i32::MAX as u128) as i32)
+    }
+}
+
+/// Convert a captured cursor buffer (wl_shm ARGB8888: B,G,R,A bytes,
+/// premultiplied alpha) to the straight-alpha BGRA image rdp-core encodes.
+/// XRGB8888 carries no alpha, so its pixels come out opaque. The hotspot is
+/// clamped into the image.
+fn cursor_image_from_shm(
+    px: &[u8],
+    size: Size,
+    fmt: wl_shm::Format,
+    hotspot: (i32, i32),
+) -> desk_backend::CursorImage {
+    let (w, h) = (size.width as usize, size.height as usize);
+    let mut bgra = vec![0u8; w * h * 4];
+    let opaque = fmt != wl_shm::Format::Argb8888;
+    for (dst, src) in bgra.as_chunks_mut::<4>().0.iter_mut().zip(px.as_chunks::<4>().0) {
+        let a = if opaque { 255 } else { src[3] };
+        if a == 0 {
+            continue; // fully transparent: leave zeroed
+        }
+        for (d, &s) in dst.iter_mut().zip(&src[..3]) {
+            *d = if a == 255 {
+                s
+            } else {
+                ((u32::from(s) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8
+            };
+        }
+        dst[3] = a;
+    }
+    let clamp = |v: i32, max: u32| v.clamp(0, max.saturating_sub(1) as i32) as u32;
+    desk_backend::CursorImage {
+        width: size.width,
+        height: size.height,
+        hot_x: clamp(hotspot.0, size.width),
+        hot_y: clamp(hotspot.1, size.height),
+        bgra,
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        state: &mut State,
+        _: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        {
+            state.seat_pointer = caps.contains(wl_seat::Capability::Pointer);
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureCursorSessionV1, ()> for State {
+    fn event(
+        state: &mut State,
+        _: &ExtImageCopyCaptureCursorSessionV1,
+        event: ext_image_copy_capture_cursor_session_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        use ext_image_copy_capture_cursor_session_v1::Event as E;
+        match event {
+            E::Enter => {
+                state.cursor.inside = true;
+                state.cursor.next_capture = None;
+            }
+            E::Leave => state.cursor.inside = false,
+            // Takes effect with the next ready frame (protocol), which is
+            // when service() reads it.
+            E::Hotspot { x, y } => state.cursor.hotspot = (x, y),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, CursorTag> for State {
+    fn event(
+        state: &mut State,
+        _: &ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
+        _: &CursorTag,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        use ext_image_copy_capture_session_v1::Event as E;
+        match event {
+            E::BufferSize { width, height } => state.cursor.size = Some(Size { width, height }),
+            E::ShmFormat {
+                format: WEnum::Value(f),
+            } => {
+                // Only ARGB8888 carries the cursor's alpha; take anything else
+                // only while nothing better was offered.
+                if state.cursor.fmt.is_none() || f == wl_shm::Format::Argb8888 {
+                    state.cursor.fmt = Some(f);
+                }
+            }
+            E::Stopped => state.cursor.stopped = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, CursorTag> for State {
+    fn event(
+        state: &mut State,
+        frame: &ExtImageCopyCaptureFrameV1,
+        event: ext_image_copy_capture_frame_v1::Event,
+        _: &CursorTag,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        use ext_image_copy_capture_frame_v1::Event as E;
+        match event {
+            E::Ready => state.cursor.ready = true,
+            E::Failed { .. } => state.cursor.failed = true,
+            _ => return,
+        }
+        // Done either way: destroying it re-arms the session for the next
+        // capture (one live frame per session).
+        frame.destroy();
+        if state.cursor.frame.as_ref() == Some(frame) {
+            state.cursor.frame = None;
         }
     }
 }
@@ -1090,7 +1451,7 @@ macro_rules! noop_dispatch {
     };
 }
 
-noop_dispatch!(wl_seat::WlSeat);
+noop_dispatch!(wl_pointer::WlPointer);
 noop_dispatch!(wl_shm::WlShm);
 noop_dispatch!(wl_shm_pool::WlShmPool);
 noop_dispatch!(wl_buffer::WlBuffer);
@@ -1291,6 +1652,8 @@ fn query_layout(own_name: &str) -> Option<((u32, u32), (i32, i32))> {
 /// call; the old session/source are destroyed if present.
 fn bind_capture(state: &mut State, queue: &mut EventQueue<State>) -> Result<()> {
     let qh = queue.handle();
+    // The cursor session hangs off the source being replaced.
+    state.cursor.release_session();
     if let Some(s) = state.session.take() {
         s.destroy();
     }
@@ -1332,12 +1695,22 @@ fn bind_capture(state: &mut State, queue: &mut EventQueue<State>) -> Result<()> 
         .ok_or_else(|| anyhow::anyhow!("ext_image_copy_capture_manager_v1 unavailable"))?;
 
     let source = source_mgr.create_source(&output, &qh, ());
-    state.session = Some(capture_mgr.create_session(
+    // Client-drawn cursor: leave the cursor out of the frames only when its
+    // own session exists, so a failed bind degrades to the painted cursor
+    // rather than to no cursor at all.
+    let client_cursor = state.cursor.bind(
+        state.seat.as_ref(),
+        state.seat_pointer,
+        &capture_mgr,
         &source,
-        ext_image_copy_capture_manager_v1::Options::PaintCursors,
         &qh,
-        (),
-    ));
+    );
+    let options = if client_cursor {
+        ext_image_copy_capture_manager_v1::Options::empty()
+    } else {
+        ext_image_copy_capture_manager_v1::Options::PaintCursors
+    };
+    state.session = Some(capture_mgr.create_session(&source, options, &qh, ()));
     state.source = Some(source);
     state.failed = false;
     state.buffer_ready = false;
@@ -2282,6 +2655,7 @@ fn pump_loop(
     prefs: WlSessionPrefs,
     input_wake_fd: i32,
     frame_wake: Option<desk_backend::FrameWake>,
+    cursor_slot: Option<desk_backend::PointerShapeSlot>,
 ) {
     eprintln!(
         "[backend-wlroots] pump start @ {}x{} scale={} kbd={}{}",
@@ -2318,6 +2692,10 @@ fn pump_loop(
     // position for rdp-core's PTR_POS_UPDATE relay, bypassing the frame
     // pipeline. None => cursor stays painted in the captured video.
     state.pointer_pos_slot = pointer_pos_slot;
+    // Client-drawn cursor (WAYRDP_CLIENT_CURSOR): bind_capture creates a
+    // cursor session next to the output session and leaves the cursor out
+    // of the frames; the pump publishes its image into this slot.
+    state.cursor.slot = cursor_slot;
     // Per-client keyboard/dpi presentation prefs from the session request:
     // XKB layout for the virtual keyboard keymap, compositor scale for the
     // headless output (HiDPI hosts keep text at physical size).
@@ -2472,6 +2850,8 @@ fn pump_loop(
         let mut resized = false;
 
         if let Some(sz) = pending_resize {
+            // No cursor frame may be in flight on the output being removed.
+            state.cursor.release_session();
             destroy_headless_output(&state.output_name);
             create_headless_output(sz, &state.output_name, state.output_scale);
             sync_layout(&mut state);
@@ -2550,6 +2930,14 @@ fn pump_loop(
         }
         if let Some((x, y)) = coalesced_motion {
             inject_ev!(InputEvent::PointerMotion { x, y });
+        }
+
+        // Client-drawn cursor: publish a changed shape and wake the peer
+        // mainloop so it reaches the client without waiting for a frame.
+        if state.cursor.service(&shm, &qh) {
+            if let Some(wake) = &frame_wake {
+                wake();
+            }
         }
 
         if state.buffer_ready {
@@ -2648,6 +3036,7 @@ fn pump_loop(
             if fail_attempts >= 3 {
                 eprintln!("[backend-wlroots] capture retry: recreating output");
                 state.pool = None;
+                state.cursor.release_session();
                 destroy_headless_output(&state.output_name);
                 state.output_name = next_output_name();
                 eprintln!("[backend-wlroots] headless output {}", state.output_name);
@@ -2723,6 +3112,11 @@ fn pump_loop(
             } else {
                 100
             };
+            // Wake for a due cursor capture rather than a full idle period.
+            let timeout_ms = state
+                .cursor
+                .wait_ms()
+                .map_or(timeout_ms, |w| timeout_ms.min(w.max(1)));
             let revents = libc_poll_read(fd, timeout_ms);
             if revents >= 0 && (revents as i16) & POLLIN != 0 {
                 // read() consumes the guard.
@@ -2749,6 +3143,10 @@ fn pump_loop(
         p.destroy();
     }
     drop(state.vkbd.take());
+    state.cursor.release_session();
+    if let Some(p) = state.cursor.pointer.take() {
+        p.release();
+    }
     drop(state.session.take());
     drop(state.source.take());
     let _ = event_queue.flush();
@@ -3294,5 +3692,30 @@ mod tests {
     fn damage_rects_reject_zero_area_rect() {
         let buf = leak_rect_payload(1, &[(10, 10, 0, 50)]);
         assert!(super::parse_damage_rects(buf, 1920, 1200).is_none());
+    }
+
+    #[test]
+    fn cursor_image_unpremultiplies_argb() {
+        use wayland_client::protocol::wl_shm::Format;
+        // B,G,R,A premultiplied: opaque, half-alpha, transparent, and an
+        // over-range channel (invalid premultiplication) that must clamp.
+        let px = [10, 20, 30, 255, 50, 25, 0, 128, 9, 9, 9, 0, 200, 0, 0, 100];
+        let size = desk_backend::Size { width: 2, height: 2 };
+        let img = super::cursor_image_from_shm(&px, size, Format::Argb8888, (1, 5));
+        assert_eq!(
+            img.bgra,
+            vec![10, 20, 30, 255, 100, 50, 0, 128, 0, 0, 0, 0, 255, 0, 0, 100]
+        );
+        assert_eq!((img.hot_x, img.hot_y), (1, 1), "hotspot clamps into the image");
+    }
+
+    #[test]
+    fn cursor_image_from_xrgb_is_opaque() {
+        use wayland_client::protocol::wl_shm::Format;
+        let px = [1, 2, 3, 0];
+        let size = desk_backend::Size { width: 1, height: 1 };
+        let img = super::cursor_image_from_shm(&px, size, Format::Xrgb8888, (-3, 0));
+        assert_eq!(img.bgra, vec![1, 2, 3, 255]);
+        assert_eq!((img.hot_x, img.hot_y), (0, 0));
     }
 }

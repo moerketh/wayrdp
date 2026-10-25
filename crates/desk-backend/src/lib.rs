@@ -84,6 +84,31 @@ pub type FrameWake = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// the peer mainloop each frame.
 pub type PointerPositionSlot = std::sync::Arc<std::sync::atomic::AtomicU64>;
 
+/// The compositor's cursor image, for a client-drawn cursor: straight-alpha
+/// BGRA rows, top-down, `width * 4` bytes each. The hotspot is relative to
+/// the image's top-left corner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorImage {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    pub bgra: Vec<u8>,
+}
+
+/// What the client should draw as its pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorUpdate {
+    Shape(std::sync::Arc<CursorImage>),
+    /// The pointer left the captured output (or the compositor hid it).
+    Hidden,
+}
+
+/// Newest-wins cursor hand-off from the backend's capture thread to the
+/// peer mainloop, which `take()`s it. Intermediate shapes are worthless once
+/// a newer one exists, so overwriting is the intended behavior.
+pub type PointerShapeSlot = std::sync::Arc<std::sync::Mutex<Option<CursorUpdate>>>;
+
 #[derive(Debug, Clone)]
 pub enum CaptureTarget {
     /// Backend creates a virtual output at exactly this size (KDE, mutter,
@@ -190,6 +215,45 @@ pub trait DesktopBackend: Send + Sync {
     fn supports_dynamic_resize(&self) -> bool;
 
     fn open(&self, req: SessionRequest) -> Result<Box<dyn CaptureSession>>;
+
+    /// Optional session clipboard, opened once per peer next to `open`.
+    /// Default `None` = rdp-core does not offer the cliprdr channel.
+    /// Like `open`, this must do no I/O: connections happen in `start`.
+    fn open_clipboard(&self) -> Option<Box<dyn Clipboard>> {
+        None
+    }
+}
+
+/// Events from the session's local (guest) clipboard.
+pub enum ClipboardEvent {
+    /// A local application took the selection; it offers these MIME types
+    /// (empty = selection cleared). Our own `offer_remote` selections are
+    /// NOT reported.
+    LocalSelection { mimes: Vec<String> },
+    /// A local application pastes remote data we offered: write the bytes
+    /// for `mime` into `sink`, then drop it (closing it ends the transfer).
+    /// Writing may block on a slow reader — do it off the event thread.
+    SendRequest {
+        mime: String,
+        sink: Box<dyn std::io::Write + Send>,
+    },
+}
+
+/// The session's clipboard, seen from the RDP side. Shared between the
+/// cliprdr workers (one per direction), hence `&self` + `Sync`: a blocking
+/// `read_local` must never hold up an `offer_remote`.
+pub trait Clipboard: Send + Sync {
+    /// Connect and start watching; events flow on `tx` until the clipboard
+    /// is dropped.
+    fn start(&mut self, tx: crossbeam_channel::Sender<ClipboardEvent>) -> Result<()>;
+
+    /// Take the local selection on behalf of the remote side, offering
+    /// `mimes`. Pastes arrive later as `ClipboardEvent::SendRequest`.
+    fn offer_remote(&self, mimes: Vec<String>) -> Result<()>;
+
+    /// Read the current local selection as `mime`. Blocks up to `timeout`;
+    /// fails past `max_bytes` rather than buffering unbounded data.
+    fn read_local(&self, mime: &str, timeout: Duration, max_bytes: usize) -> Result<Vec<u8>>;
 }
 
 pub trait CaptureSession: Send {
@@ -217,6 +281,16 @@ pub trait CaptureSession: Send {
     /// PTR_POS_UPDATE, so echoing injected motion back at 50-100 ms latency
     /// would make the xfreerdp cursor fight the user.
     fn set_pointer_position_slot(&mut self, _slot: PointerPositionSlot) {}
+
+    /// Client-drawn cursor: the backend stops painting the cursor into the
+    /// captured frames and publishes the compositor's cursor image into
+    /// `slot` instead; rdp-core sends it as the client's pointer shape, so
+    /// the pointer moves at the client's own speed with no second cursor in
+    /// the video. Returns `false` (default) when the backend cannot deliver
+    /// cursor images — the cursor then stays painted in the video.
+    fn set_pointer_shape_slot(&mut self, _slot: PointerShapeSlot) -> bool {
+        false
+    }
 
     /// Optional frame-wake hook: rdp-core installs this before `start()`.
     /// The backend calls it right after each frame send so the consumer's
