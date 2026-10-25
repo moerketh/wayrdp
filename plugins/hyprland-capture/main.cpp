@@ -108,10 +108,26 @@ struct Target {
     char     sockPath[256];
 
     Target(const std::string& monName) {
-        std::snprintf(shmPath, sizeof(shmPath),
-                      "/wayrdp-capture-%s", monName.c_str());
-        std::snprintf(curPath, sizeof(curPath),
-                      "/wayrdp-cursor-%s", monName.c_str());
+        // Shm names embed the per-boot random token (see shmToken): /dev/shm
+        // is world-writable, and a predictable name lets another local user
+        // pre-create the object so shmCreateOwned's ownership gate refuses
+        // takeover and capture is denied. With the token in the name, a
+        // cross-user squatter cannot know what to squat. Empty token (no
+        // usable XDG_RUNTIME_DIR) falls back to the legacy deterministic
+        // name — the reader (wayrdp backend-wlroots) makes the same
+        // decision, so both sides still agree on the path.
+        const std::string tok = shmToken();
+        if (tok.empty()) {
+            std::snprintf(shmPath, sizeof(shmPath),
+                          "/wayrdp-capture-%s", monName.c_str());
+            std::snprintf(curPath, sizeof(curPath),
+                          "/wayrdp-cursor-%s", monName.c_str());
+        } else {
+            std::snprintf(shmPath, sizeof(shmPath),
+                          "/wayrdp-capture-%s-%s", monName.c_str(), tok.c_str());
+            std::snprintf(curPath, sizeof(curPath),
+                          "/wayrdp-cursor-%s-%s", monName.c_str(), tok.c_str());
+        }
         // Frame-notify datagram target (best-effort; nothing binds it yet).
         // Under XDG_RUNTIME_DIR — a user-private dir — not world-writable
         // /tmp, so a local user can't pre-create squatting paths.
@@ -125,6 +141,67 @@ struct Target {
 };
 
 static std::unordered_map<std::string, Target> g_targets;
+
+// Per-boot random token shared with wayrdp's backend-wlroots reader so the
+// /dev/shm object names are unguessable by other local users (see the
+// Target constructor). Stored as a 0600 file under the user-private
+// XDG_RUNTIME_DIR; whichever side needs it first creates it, the loser of
+// the create race adopts the winner's token. Returns "" when no usable
+// runtime dir exists — callers then use the legacy deterministic names.
+static std::string shmToken() {
+    static const std::string cached = []() -> std::string {
+        const char* rt = std::getenv("XDG_RUNTIME_DIR");
+        if (!rt || !*rt)
+            return std::string();
+        std::string path = std::string(rt) + "/wayrdp-shm-token";
+        // Adopt an existing token.
+        {
+            FILE* f = std::fopen(path.c_str(), "r");
+            if (f) {
+                char buf[33] = {0};
+                const size_t n = std::fread(buf, 1, 32, f);
+                std::fclose(f);
+                if (n > 0) {
+                    std::string tok(buf, n);
+                    while (!tok.empty() && (tok.back() == '\n' || tok.back() == ' '))
+                        tok.pop_back();
+                    if (!tok.empty())
+                        return tok;
+                }
+            }
+        }
+        // Create one: 16 random bytes, hex.
+        unsigned char rnd[16] = {0};
+        FILE* u = std::fopen("/dev/urandom", "r");
+        if (!u)
+            return std::string();
+        const bool ok = std::fread(rnd, 1, sizeof(rnd), u) == sizeof(rnd);
+        std::fclose(u);
+        if (!ok)
+            return std::string();
+        char tok[33] = {0};
+        for (size_t i = 0; i < sizeof(rnd); i++)
+            std::snprintf(tok + 2 * i, 3, "%02x", rnd[i]);
+        // O_CREAT|O_EXCL, 0600: lose a race with the daemon → adopt theirs.
+        const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            const ssize_t w = ::write(fd, tok, 32);
+            close(fd);
+            if (w == 32)
+                return std::string(tok, 32);
+        }
+        FILE* f = std::fopen(path.c_str(), "r");
+        if (f) {
+            char buf[33] = {0};
+            const size_t n = std::fread(buf, 1, 32, f);
+            std::fclose(f);
+            if (n > 0)
+                return std::string(buf, n);
+        }
+        return std::string();
+    }();
+    return cached;
+}
 
 static bool g_cursorHooked = false; // both client-cursor hooks are live
 

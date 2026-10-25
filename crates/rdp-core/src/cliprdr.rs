@@ -40,6 +40,13 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LOCAL_ENTRIES: usize = 10_000;
+/// Entries accepted from a client FileGroupDescriptorW (host → guest
+/// downloads). Mirrors MAX_LOCAL_ENTRIES on the serving side.
+const MAX_REMOTE_ENTRIES: usize = 10_000;
+/// Aggregate byte budget for one host → guest download announcement. The
+/// client controls both the declared per-entry sizes and every response
+/// body, so without a budget a malicious peer can fill the user's disk.
+const MAX_DOWNLOAD_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 /// FILECONTENTS range size per request (host → guest downloads).
 const RANGE_CHUNK: u32 = 1024 * 1024;
 /// Largest range we serve per client request (guest → host).
@@ -90,6 +97,11 @@ struct Shared {
     clipboard: Mutex<Option<Arc<dyn Clipboard>>>,
     out_tx: Mutex<Option<Sender<OutJob>>>,
     remote: Mutex<RemoteOffer>,
+    /// Staging directories this peer created (host → guest downloads);
+    /// drained on the next download and removed on Drop. Tracked per
+    /// instance so teardown never deletes a concurrent peer's downloads
+    /// (the staging root is shared per user account).
+    staging: Mutex<Vec<PathBuf>>,
     /// Waiter for the next ClientFormatDataResponse (None = failed).
     data_waiter: Mutex<Option<Sender<Option<Vec<u8>>>>>,
     file_waiters: Mutex<HashMap<u32, Sender<Option<Vec<u8>>>>>,
@@ -153,6 +165,7 @@ impl Cliprdr {
             clipboard: Mutex::new(Some(Arc::from(clipboard))),
             out_tx: Mutex::new(Some(out_tx)),
             remote: Mutex::new(RemoteOffer::default()),
+            staging: Mutex::new(Vec::new()),
             data_waiter: Mutex::new(None),
             file_waiters: Mutex::new(HashMap::new()),
             fetch_lock: Mutex::new(()),
@@ -178,7 +191,11 @@ impl Cliprdr {
             .spawn(move || event_loop(w, ev_rx));
 
         let rc = wayrdp_cliprdr_start(ctx);
-        let me = Box::new(Cliprdr { shared, ctx, custom });
+        let me = Box::new(Cliprdr {
+            shared,
+            ctx,
+            custom,
+        });
         if rc != 0 {
             eprintln!("[cliprdr] Start failed (0x{rc:x}); no clipboard redirection");
             return None; // Drop tears down the workers and the context
@@ -203,6 +220,15 @@ impl Drop for Cliprdr {
         self.shared.file_waiters.lock().unwrap().clear();
         self.shared.out_tx.lock().unwrap().take();
         self.shared.clipboard.lock().unwrap().take();
+        // Remove this peer's staging downloads: the channel is gone, so
+        // nothing can paste them anymore, and pasted-file trees otherwise
+        // accumulate in the cache directory forever. Best-effort — the
+        // paste may have already moved/consumed them.
+        for dir in self.shared.staging.lock().unwrap().drain(..) {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                eprintln!("[cliprdr] staging cleanup {}: {e}", dir.display());
+            }
+        }
     }
 }
 
@@ -246,7 +272,9 @@ unsafe extern "C" fn on_client_format_list(
                 };
                 match (f.formatId, name.as_deref()) {
                     (fmt::CF_UNICODETEXT, _) => text = Some(fmt::CF_UNICODETEXT),
-                    (fmt::CF_TEXT | fmt::CF_OEMTEXT, _) if text.is_none() => text = Some(f.formatId),
+                    (fmt::CF_TEXT | fmt::CF_OEMTEXT, _) if text.is_none() => {
+                        text = Some(f.formatId)
+                    }
                     (id, Some(fmt::FILEGROUPDESCRIPTORW_NAME)) => files = Some(id),
                     _ => {}
                 }
@@ -303,7 +331,8 @@ unsafe extern "C" fn on_client_format_data_response(
 ) -> UINT {
     callback(c, |s| {
         let payload = response_bytes(
-            r.as_ref().map(|r| (r.common.msgFlags, r.requestedFormatData, r.common.dataLen)),
+            r.as_ref()
+                .map(|r| (r.common.msgFlags, r.requestedFormatData, r.common.dataLen)),
         );
         if let Some(w) = s.data_waiter.lock().unwrap().take() {
             let _ = w.send(payload);
@@ -492,15 +521,23 @@ fn serve_file(
         let mut f = std::fs::File::open(&entry.path).ok()?;
         f.seek(SeekFrom::Start(position)).ok()?;
         let mut buf = Vec::new();
-        f.take(u64::from(cb.min(MAX_SERVE_CHUNK))).read_to_end(&mut buf).ok()?;
+        f.take(u64::from(cb.min(MAX_SERVE_CHUNK)))
+            .read_to_end(&mut buf)
+            .ok()?;
         Some(buf)
     })();
     s.with_ctx(|c| unsafe {
         match &result {
-            Some(d) => {
-                wayrdp_cliprdr_send_file_contents_response(c, stream_id, 1, d.as_ptr(), d.len() as u32)
+            Some(d) => wayrdp_cliprdr_send_file_contents_response(
+                c,
+                stream_id,
+                1,
+                d.as_ptr(),
+                d.len() as u32,
+            ),
+            None => {
+                wayrdp_cliprdr_send_file_contents_response(c, stream_id, 0, std::ptr::null(), 0)
             }
-            None => wayrdp_cliprdr_send_file_contents_response(c, stream_id, 0, std::ptr::null(), 0),
         }
     });
 }
@@ -626,6 +663,13 @@ fn download_files(s: &Shared, files_format: u32, seq: u64) -> Option<Vec<PathBuf
             return None;
         }
     };
+    if descs.len() > MAX_REMOTE_ENTRIES {
+        eprintln!(
+            "[cliprdr] announcement has {} entries (max {MAX_REMOTE_ENTRIES}); refusing download",
+            descs.len()
+        );
+        return None;
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -635,21 +679,52 @@ fn download_files(s: &Shared, files_format: u32, seq: u64) -> Option<Vec<PathBuf
         eprintln!("[cliprdr] cannot create staging dir {}: {e}", dir.display());
         return None;
     }
+    // Superseded staging trees from earlier announcements of this peer are
+    // dead weight (files_cache only serves the newest seq); remove them so
+    // one long-lived connection cannot accumulate one budget's worth per
+    // paste. The fresh dir is tracked for Drop-time cleanup.
+    {
+        let mut staging = s.staging.lock().unwrap();
+        for old in staging.drain(..) {
+            if old != dir {
+                let _ = std::fs::remove_dir_all(old);
+            }
+        }
+        staging.push(dir.clone());
+    }
+
+    // The client controls every declared size AND every response body, so
+    // the budget is decremented by bytes actually written; an entry that
+    // cannot fit the remainder is skipped, and budget exhaustion mid-file
+    // aborts the announcement.
+    let mut remaining: u64 = MAX_DOWNLOAD_TOTAL;
 
     let mut tops: Vec<PathBuf> = Vec::new();
     for (index, d) in descs.iter().enumerate() {
         let Some(rel) = fmt::sanitize_relative(&d.name) else {
-            eprintln!("[cliprdr] refusing unsafe file name from client: {:?}", d.name);
+            eprintln!(
+                "[cliprdr] refusing unsafe file name from client: {:?}",
+                d.name
+            );
             continue;
         };
         let target = dir.join(&rel);
-        if rel.components().count() == 1 {
-            tops.push(target.clone());
-        }
         if d.is_dir {
             if std::fs::create_dir_all(&target).is_err() {
                 return None;
             }
+            if rel.components().count() == 1 {
+                tops.push(target.clone());
+            }
+            continue;
+        }
+        if d.size > remaining {
+            eprintln!(
+                "[cliprdr] entry {:?} declares {} bytes, over the announcement budget ({} left); skipping",
+                d.name,
+                d.size,
+                remaining
+            );
             continue;
         }
         if let Some(parent) = target.parent() {
@@ -657,29 +732,87 @@ fn download_files(s: &Shared, files_format: u32, seq: u64) -> Option<Vec<PathBuf
                 return None;
             }
         }
-        if !download_one(s, index as u32, d.size, &target) {
+        if !download_one(s, index as u32, d.size, &target, &mut remaining) {
             eprintln!("[cliprdr] download of {:?} failed", d.name);
             let _ = std::fs::remove_file(&target);
             return None;
+        }
+        if rel.components().count() == 1 {
+            tops.push(target.clone());
         }
     }
     Some(tops)
 }
 
-fn download_one(s: &Shared, list_index: u32, size: u64, target: &PathBuf) -> bool {
+fn download_one(
+    s: &Shared,
+    list_index: u32,
+    size: u64,
+    target: &PathBuf,
+    remaining: &mut u64,
+) -> bool {
     let Ok(mut f) = std::fs::File::create(target) else {
         return false;
     };
     let mut pos = 0u64;
     while pos < size {
-        let want = (size - pos).min(u64::from(RANGE_CHUNK)) as u32;
+        let want = (size - pos).min(u64::from(RANGE_CHUNK)).min(*remaining) as u32;
+        if want == 0 {
+            // Budget exhausted mid-file: abort the announcement rather
+            // than truncate silently.
+            return false;
+        }
         let Some(chunk) = request_range(s, list_index, pos, want) else {
             return false;
         };
-        if chunk.is_empty() || f.write_all(&chunk).is_err() {
+        if chunk.is_empty() {
             return false;
         }
-        pos += chunk.len() as u64;
+        let take = accepted_chunk_len(chunk.len(), want, *remaining);
+        if f.write_all(&chunk[..take]).is_err() {
+            return false;
+        }
+        *remaining -= take as u64;
+        pos += take as u64;
     }
     true
+}
+
+/// Bytes of a client FILECONTENTS response to accept for a request of
+/// `want` bytes: the response length is client-controlled wire data, so it
+/// may never exceed what was requested of it, and never the budget.
+fn accepted_chunk_len(chunk_len: usize, want: u32, remaining: u64) -> usize {
+    chunk_len
+        .min(want as usize)
+        .min(remaining.min(u32::MAX as u64) as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_chunks_are_clamped_to_the_request() {
+        // A client answering a 1 MiB range request with more bytes than
+        // were asked for must not inflate the staged file past the
+        // announced size: only `want` bytes are accepted.
+        assert_eq!(
+            accepted_chunk_len(2 * 1024 * 1024, RANGE_CHUNK, u64::MAX),
+            RANGE_CHUNK as usize
+        );
+        assert_eq!(accepted_chunk_len(4096, 4096, u64::MAX), 4096);
+        assert_eq!(accepted_chunk_len(100, 4096, u64::MAX), 100);
+        // Budget always binds, even against an oversized chunk.
+        assert_eq!(accepted_chunk_len(4096, RANGE_CHUNK, 1000), 1000);
+        assert_eq!(accepted_chunk_len(4096, 4096, 0), 0);
+    }
+
+    #[test]
+    fn download_caps_are_sane() {
+        // The announcement gate mirrors the serving-side entry cap, and the
+        // aggregate budget bounds every response body a peer can land on
+        // disk for one announcement.
+        assert_eq!(MAX_REMOTE_ENTRIES, MAX_LOCAL_ENTRIES);
+        assert!(MAX_DOWNLOAD_TOTAL >= u64::from(MAX_TEXT_BYTES as u64));
+    }
 }

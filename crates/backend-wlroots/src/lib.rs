@@ -81,6 +81,33 @@ static OUTPUT_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// removal always happens while its only capture session is quiescent.
 static PUMP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Outputs owned by a live pump in THIS process, name-exact. The pump-lease
+/// timeout path proceeds without PUMP_ACTIVE, so "flag clear" can no longer
+/// mean "no live wayrdp output exists" — a later lease-holder's
+/// cleanup_stale_outputs would then remove that uncounted pump's live output
+/// (poisoning its wl_output and, with a capture frame in flight, triggering
+/// the documented Hyprland SIGABRT). The sweep consults this registry and
+/// never removes a name a live pump owns, regardless of lease state.
+static LIVE_OUTPUTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Reserve an output name for this pump BEFORE the create, so no concurrent
+/// lease-holder's sweep can race the create→register window.
+fn live_output_add(name: &str) {
+    let mut live = LIVE_OUTPUTS.lock().unwrap_or_else(|p| p.into_inner());
+    if !live.iter().any(|n| n == name) {
+        live.push(name.to_string());
+    }
+}
+
+/// Release the name at teardown; called before/with destroy_headless_output
+/// on every path that ends this pump's ownership of the output.
+fn live_output_remove(name: &str) {
+    LIVE_OUTPUTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|n| n != name);
+}
+
 /// Resolve the signature of the *live* Hyprland instance.
 ///
 /// wayrdp shells out to `hyprctl`, which locates the compositor via
@@ -247,6 +274,18 @@ fn cleanup_stale_outputs() {
             continue;
         };
         if name == OUTPUT_PREFIX || name.starts_with(&format!("{OUTPUT_PREFIX}-")) {
+            // Never remove an output a live pump in this process owns: the
+            // lease-timeout path creates pumps PUMP_ACTIVE cannot see, and
+            // the sweep must stay liveness-aware, not lease-assuming.
+            if LIVE_OUTPUTS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|n| n == name)
+            {
+                eprintln!("[backend-wlroots] skipping live output {name}");
+                continue;
+            }
             eprintln!("[backend-wlroots] removing stale output {name}");
             let _ = hyprctl_run(&["output", "remove", name]);
         }
@@ -928,7 +967,12 @@ fn cursor_image_from_shm(
     let (w, h) = (size.width as usize, size.height as usize);
     let mut bgra = vec![0u8; w * h * 4];
     let opaque = fmt != wl_shm::Format::Argb8888;
-    for (dst, src) in bgra.as_chunks_mut::<4>().0.iter_mut().zip(px.as_chunks::<4>().0) {
+    for (dst, src) in bgra
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(px.as_chunks::<4>().0)
+    {
         let a = if opaque { 255 } else { src[3] };
         if a == 0 {
             continue; // fully transparent: leave zeroed
@@ -2229,8 +2273,89 @@ fn plugin_supports_client_cursor(hdr_size: usize, header: &[u8]) -> bool {
             .is_some_and(|w| u32::from_ne_bytes(w.try_into().unwrap()) & CAP_CLIENT_CURSOR != 0)
 }
 
+/// Per-boot random token shared by the daemon and the in-compositor plugin
+/// so /dev/shm object names are unguessable: a cross-user squatter cannot
+/// pre-create `wayrdp-capture-*` (name squat denial-of-service) when the
+/// name embeds a 128-bit random value it cannot read. The token lives in a
+/// 0600 file under the user-private XDG_RUNTIME_DIR; whichever side needs
+/// it first creates it (O_EXCL, loser re-reads). A missing/unusable runtime
+/// dir falls back to the empty token, i.e. the legacy deterministic name —
+/// both sides make the same decision in the same session, so they still
+/// agree on the path.
+fn shm_token() -> String {
+    fn token_path() -> Option<std::path::PathBuf> {
+        let rt = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)?;
+        if rt.as_os_str().is_empty() {
+            return None;
+        }
+        Some(rt.join("wayrdp-shm-token"))
+    }
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(path) = token_path() else {
+        return String::new();
+    };
+    if let Ok(mut f) = std::fs::File::open(&path) {
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_ok() && !buf.trim().is_empty() {
+            return buf.trim().to_string();
+        }
+    }
+    // Create it: 16 random bytes from /dev/urandom, hex-encoded, mode 0600.
+    let rnd: [u8; 16] = match std::fs::File::open("/dev/urandom") {
+        Ok(mut f) => {
+            let mut a = [0u8; 16];
+            match f.read_exact(&mut a) {
+                Ok(()) => a,
+                Err(_) => return String::new(),
+            }
+        }
+        Err(_) => return String::new(),
+    };
+    let token: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            let _ = f.write_all(token.as_bytes());
+        }
+        Err(_) => {
+            // Lost a create race (daemon vs plugin): adopt the winner's token.
+            if let Ok(mut f) = std::fs::File::open(&path) {
+                let mut buf = String::new();
+                if f.read_to_string(&mut buf).is_ok() && !buf.trim().is_empty() {
+                    return buf.trim().to_string();
+                }
+            }
+        }
+    }
+    token
+}
+
+/// Shared per-boot shm token (see shm_token); read once per process.
+fn shm_token_once() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(shm_token)
+}
+
+/// /dev/shm object name for `kind` ("capture"/"cursor") on `output_name`,
+/// embedding the per-boot token when one exists (unguessable names) and
+/// falling back to the legacy deterministic name when not. The plugin
+/// derives the identical name with the identical rule.
+fn shm_object_name(kind: &str, output_name: &str, token: &str) -> String {
+    if token.is_empty() {
+        format!("/dev/shm/wayrdp-{kind}-{output_name}")
+    } else {
+        format!("/dev/shm/wayrdp-{kind}-{output_name}-{token}")
+    }
+}
+
 /// Cursor image the capture plugin publishes for a client-drawn cursor
-/// (`/dev/shm/wayrdp-cursor-<output>`, see CursorHeader in
+/// (`/dev/shm/wayrdp-cursor-<output>[-<token>]`, see CursorHeader in
 /// plugins/hyprland-capture/main.cpp): magic u32, version u32, seq u64
 /// (seqlock), width u32, height u32, hot_x i32, hot_y i32, visible u32,
 /// then ARGB8888 rows from byte 64.
@@ -2245,7 +2370,7 @@ impl PluginCursor {
     const MAX: u32 = 256;
 
     fn path_for(output_name: &str) -> std::path::PathBuf {
-        format!("/dev/shm/wayrdp-cursor-{output_name}").into()
+        shm_object_name("cursor", output_name, shm_token_once()).into()
     }
 
     fn open(path: &std::path::Path) -> Option<Self> {
@@ -2402,12 +2527,13 @@ impl ShmCapture {
     const HDR_SIZE_V2: usize = 256;
     const ACTIVE_OFFSET: usize = 160;
 
-    /// Per-session shm path, keyed by this session's headless output name.
-    /// Two concurrent peers create distinct wayrdp-N outputs; a shared path
+    /// Per-session shm path, keyed by this session's headless output name
+    /// plus the per-boot token (see shm_token). Two concurrent peers create
+    /// distinct wayrdp-N outputs; a shared path
     /// makes the second (different-sized) peer read the first buffer and go
     /// black (observed with mstsc 1366x768 over a live 1920x1200 session).
     fn path_for(output_name: &str) -> std::path::PathBuf {
-        format!("/dev/shm/wayrdp-capture-{output_name}").into()
+        shm_object_name("capture", output_name, shm_token_once()).into()
     }
 
     /// Open and mmap the shm; None if it doesn't exist yet or fails the
@@ -2865,6 +2991,7 @@ fn pump_loop(
     let _lease = lease;
     state.output_name = next_output_name();
     eprintln!("[backend-wlroots] headless output {}", state.output_name);
+    live_output_add(&state.output_name);
     create_headless_output(initial, &state.output_name, state.output_scale);
     // First sync is best-effort: the hl.monitor mode-pin inside
     // create_headless_output is applied asynchronously, so this read can
@@ -2903,6 +3030,7 @@ fn pump_loop(
             state.output_name
         );
         let name = state.output_name.clone();
+        live_output_remove(&name);
         destroy_headless_output(&name);
         return;
     }
@@ -2933,6 +3061,7 @@ fn pump_loop(
         None => {
             eprintln!("[backend-wlroots] wl_shm unavailable; compositor offers no shm readback");
             let name = state.output_name.clone();
+            live_output_remove(&name);
             destroy_headless_output(&name);
             return;
         }
@@ -2943,6 +3072,7 @@ fn pump_loop(
         Err(e) => {
             eprintln!("[backend-wlroots] shm pool alloc failed: {e}");
             let name = state.output_name.clone();
+            live_output_remove(&name);
             destroy_headless_output(&name);
             return;
         }
@@ -3165,9 +3295,11 @@ fn pump_loop(
                 eprintln!("[backend-wlroots] capture retry: recreating output");
                 state.pool = None;
                 state.cursor.release_session();
+                live_output_remove(&state.output_name);
                 destroy_headless_output(&state.output_name);
                 state.output_name = next_output_name();
                 eprintln!("[backend-wlroots] headless output {}", state.output_name);
+                live_output_add(&state.output_name);
                 create_headless_output(state.frame_size, &state.output_name, state.output_scale);
                 sync_layout(&mut state);
             }
@@ -3278,6 +3410,7 @@ fn pump_loop(
     drop(state.session.take());
     drop(state.source.take());
     let _ = event_queue.flush();
+    live_output_remove(&state.output_name);
     destroy_headless_output(&state.output_name);
     eprintln!(
         "[backend-wlroots] teardown {}: output remove returned",
@@ -3833,6 +3966,7 @@ fn pump_loop_shm(
         }
     }
     let _ = event_queue.flush();
+    live_output_remove(&state.output_name);
     destroy_headless_output(&state.output_name);
     eprintln!(
         "[backend-wlroots] teardown {}: shm output remove returned",
@@ -3848,6 +3982,53 @@ fn pump_loop_shm(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn shm_names_embed_the_token_and_fall_back_without_one() {
+        // With a token the name is unguessable by another local user; the
+        // plugin derives the identical name from the identical rule.
+        assert_eq!(
+            super::shm_object_name("capture", "wayrdp-7", "0123abcd"),
+            "/dev/shm/wayrdp-capture-wayrdp-7-0123abcd"
+        );
+        assert_eq!(
+            super::shm_object_name("cursor", "wayrdp-7", "0123abcd"),
+            "/dev/shm/wayrdp-cursor-wayrdp-7-0123abcd"
+        );
+        // No usable XDG_RUNTIME_DIR: legacy deterministic names, identical
+        // on both sides.
+        assert_eq!(
+            super::shm_object_name("capture", "wayrdp-7", ""),
+            "/dev/shm/wayrdp-capture-wayrdp-7"
+        );
+        assert_eq!(
+            super::shm_object_name("cursor", "wayrdp-7", ""),
+            "/dev/shm/wayrdp-cursor-wayrdp-7"
+        );
+    }
+
+    #[test]
+    fn live_output_registry_tracks_ownership() {
+        // The sweep's liveness source: add before create, remove at
+        // teardown, no duplicate entries, other names untouched.
+        super::live_output_add("wayrdp-1");
+        super::live_output_add("wayrdp-1"); // idempotent
+        super::live_output_add("wayrdp-2");
+        {
+            let live = super::LIVE_OUTPUTS.lock().unwrap();
+            assert!(live.iter().any(|n| n == "wayrdp-1"));
+            assert!(live.iter().any(|n| n == "wayrdp-2"));
+            assert_eq!(live.iter().filter(|n| **n == "wayrdp-1").count(), 1);
+        }
+        super::live_output_remove("wayrdp-1");
+        {
+            let live = super::LIVE_OUTPUTS.lock().unwrap();
+            assert!(!live.iter().any(|n| n == "wayrdp-1"));
+            assert!(live.iter().any(|n| n == "wayrdp-2"));
+        }
+        super::live_output_remove("wayrdp-2");
+        assert!(super::LIVE_OUTPUTS.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn trace_marker_parses_offset_and_colour() {
         assert_eq!(
             super::parse_trace_marker("60,0,ff00ff"),
@@ -3861,14 +4042,24 @@ mod tests {
             super::parse_trace_marker(" -4 , 7 , 00FF10 ").map(|m| (m.dx, m.dy, m.rgb)),
             Some((-4, 7, [0, 0xff, 0x10]))
         );
-        for bad in ["", "60,0", "60,0,ff00f", "60,0,ff00ff,1", "x,0,ff00ff", "60,0,gg00ff"] {
+        for bad in [
+            "",
+            "60,0",
+            "60,0,ff00f",
+            "60,0,ff00ff,1",
+            "x,0,ff00ff",
+            "60,0,gg00ff",
+        ] {
             assert_eq!(super::parse_trace_marker(bad), None, "{bad}");
         }
     }
 
     #[test]
     fn marker_matches_bgra_with_tolerance_and_bounds() {
-        let size = desk_backend::Size { width: 2, height: 2 };
+        let size = desk_backend::Size {
+            width: 2,
+            height: 2,
+        };
         // stride 12: 2 px + 4 bytes row padding
         let mut px = vec![0u8; 24];
         // (1,1) = magenta, slightly off, in BGRA
@@ -4068,20 +4259,30 @@ mod tests {
         // B,G,R,A premultiplied: opaque, half-alpha, transparent, and an
         // over-range channel (invalid premultiplication) that must clamp.
         let px = [10, 20, 30, 255, 50, 25, 0, 128, 9, 9, 9, 0, 200, 0, 0, 100];
-        let size = desk_backend::Size { width: 2, height: 2 };
+        let size = desk_backend::Size {
+            width: 2,
+            height: 2,
+        };
         let img = super::cursor_image_from_shm(&px, size, Format::Argb8888, (1, 5));
         assert_eq!(
             img.bgra,
             vec![10, 20, 30, 255, 100, 50, 0, 128, 0, 0, 0, 0, 255, 0, 0, 100]
         );
-        assert_eq!((img.hot_x, img.hot_y), (1, 1), "hotspot clamps into the image");
+        assert_eq!(
+            (img.hot_x, img.hot_y),
+            (1, 1),
+            "hotspot clamps into the image"
+        );
     }
 
     #[test]
     fn cursor_image_from_xrgb_is_opaque() {
         use wayland_client::protocol::wl_shm::Format;
         let px = [1, 2, 3, 0];
-        let size = desk_backend::Size { width: 1, height: 1 };
+        let size = desk_backend::Size {
+            width: 1,
+            height: 1,
+        };
         let img = super::cursor_image_from_shm(&px, size, Format::Xrgb8888, (-3, 0));
         assert_eq!(img.bgra, vec![1, 2, 3, 255]);
         assert_eq!((img.hot_x, img.hot_y), (0, 0));

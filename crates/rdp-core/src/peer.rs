@@ -103,6 +103,11 @@ pub struct PeerContext {
     pub frame_id: UINT32,
     /// True once `Activate` has run.
     pub activated: bool,
+    /// Session request captured at post_connect and consumed by
+    /// peer_activate: all-zero bytes are NOT a valid SessionRequest, so
+    /// peer_context_new_inner stores None right away (same discipline as
+    /// the other non-POD Options below).
+    pub pending_session_req: Option<SessionRequest>,
     /// Transparent-pointer resend flag: set by activate/failed first-send,
     /// consumed once the slow-path frame loop (send_frame) re-sends it.
     pub pointer_resend: bool,
@@ -525,6 +530,7 @@ unsafe fn peer_context_new_inner(ctx: *mut rdpContext) -> BOOL {
     // calloc'd bits.
     ptr::write(&mut (*ctx).session, None);
     ptr::write(&mut (*ctx).frame_rx, None);
+    ptr::write(&mut (*ctx).pending_session_req, None);
     ptr::write(&mut (*ctx).pointer_pos_slot, None);
     (*ctx).pointer_pos_last = 0;
     ptr::write(&mut (*ctx).cursor_slot, None);
@@ -594,6 +600,7 @@ unsafe fn peer_context_free_inner(ctx: *mut rdpContext) {
         (*ctx).vcm = ptr::null_mut();
     }
     (*ctx).frame_rx = None;
+    (*ctx).pending_session_req = None;
     (*ctx).pointer_pos_slot = None;
     (*ctx).cursor_slot = None;
     (*ctx).cursor_last = None;
@@ -703,74 +710,18 @@ unsafe fn peer_post_connect_inner(client: *mut rdp_freerdp_peer) -> BOOL {
             FreeRDP_Settings_Keys_UInt32_FreeRDP_DesktopScaleFactor,
         ),
     };
-    let mut session = match (state.open_session)(req) {
-        Some(s) => s,
-        None => return 0,
-    };
-    let (tx, rx) = channel::<Frame>();
-    // Metadata-cursor relay: the backend publishes the latest SESSION-space
-    // cursor position into this slot; the mainloop forwards it newest-wins
-    // as PTR_POS_UPDATE. OFF BY DEFAULT (WAYRDP_POINTER_METADATA): the relay
-    // is half of Metadata mode — until the cursor SHAPE is also sent (and
-    // Hyprland's cursor on the captured output hidden), the client still
-    // draws its transparent painted-cursor shape, so the packet has no
-    // visible effect on mstsc/vmconnect, while FreeRDP clients WARP THE
-    // LOCAL CURSOR on PTR_POS_UPDATE: echoing injected motion back at wire
-    // latency makes the xfreerdp cursor fight the user's hand.
-    // Client-drawn cursor (WAYRDP_CLIENT_CURSOR): the client draws the
-    // compositor's cursor image itself, so the pointer moves at local speed
-    // and the video carries no cursor (no lag trail, no second pointer).
-    // Off by default until the T4 pointer tests pass on vmconnect.
-    let cursor_slot: Option<desk_backend::PointerShapeSlot> =
-        if std::env::var_os("WAYRDP_CLIENT_CURSOR").is_some() {
-            let slot: desk_backend::PointerShapeSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
-            if session.set_pointer_shape_slot(slot.clone()) {
-                eprintln!("[peer_post_connect] client-drawn cursor on");
-                Some(slot)
-            } else {
-                eprintln!("[peer_post_connect] backend cannot deliver cursor images; cursor stays painted");
-                None
-            }
-        } else {
-            None
-        };
-    // No position echo with a client-drawn cursor: the client already moves
-    // its own pointer, and FreeRDP clients warp on every PTR_POS_UPDATE.
-    let pos_slot: Option<desk_backend::PointerPositionSlot> =
-        if cursor_slot.is_none() && std::env::var_os("WAYRDP_POINTER_METADATA").is_some() {
-            let slot: desk_backend::PointerPositionSlot =
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            session.set_pointer_position_slot(slot.clone());
-            Some(slot)
-        } else {
-            None
-        };
-
-    // e6: WinPR event signalled after every frame send so the mainloop's
-    // wait returns immediately on a new frame instead of at the next 16ms
-    // tick. The closure below is what the backend pump thread calls: it must
-    // only SetEvent (cheap, non-blocking) — never block the pump on the
-    // protocol thread.
-    (*ctx).frame_event = wayrdp_create_event();
-    if !(*ctx).frame_event.is_null() {
-        let ev = (*ctx).frame_event as usize;
-        let wake: desk_backend::FrameWake = std::sync::Arc::new(move || unsafe {
-            wayrdp_set_event(ev as HANDLE);
-        });
-        session.set_frame_wake(wake);
-    } else {
-        eprintln!("[peer_post_connect] frame event creation failed; falling back to frame polling");
-    }
-
-    if session.start(tx).is_err() {
-        eprintln!("[peer_post_connect] session.start failed");
-        return 0;
-    }
-    (*ctx).session = Some(session);
-    (*ctx).frame_rx = Some(rx);
-    (*ctx).pointer_pos_slot = pos_slot;
-    (*ctx).cursor_slot = cursor_slot;
-    eprintln!("[peer_post_connect] session started ok");
+    // The backend session is NOT opened here. Opening it at post_connect
+    // started the capture pump before the client ever activated, pushing
+    // frames into the unbounded frame channel that nothing drains until
+    // Activate — a peer that handshakes and then stalls accumulated
+    // full-resolution frames for the whole activation window (memory
+    // exhaustion; GBs at 30 s for large negotiated sizes). peer_activate
+    // opens the session instead, so a never-activating peer never creates
+    // a capture pump or a frame queue. Input and clipboard pre-activation
+    // are unaffected: inject_input tolerates session=None and cliprdr does
+    // not touch the session.
+    (*ctx).pending_session_req = Some(req);
+    eprintln!("[peer_post_connect] session deferred to activate");
 
     // F3: slow-path frame back-pressure is released by SurfaceFrameAcknowledge
     // (the client sends it for every END marker); without the callback the
@@ -843,9 +794,99 @@ unsafe fn peer_post_connect_inner(client: *mut rdp_freerdp_peer) -> BOOL {
                 (*ctx).cliprdr =
                     crate::cliprdr::Cliprdr::start((*ctx).vcm, ctx as *mut rdpContext, clipboard);
             }
-            None => eprintln!("[peer_post_connect] backend offers no clipboard; cliprdr not served"),
+            None => {
+                eprintln!("[peer_post_connect] backend offers no clipboard; cliprdr not served")
+            }
         }
     }
+    1
+}
+
+/// Open and start the backend capture session for an activated peer.
+/// Called from peer_activate (NOT post_connect) so a peer that never
+/// activates never starts a capture pump or accumulates frames.
+unsafe fn start_session(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) -> BOOL {
+    let state = (*client).ContextExtra as *mut ServerState;
+    if state.is_null() {
+        return 0;
+    }
+    let state = &mut *state;
+    let Some(req) = (*ctx).pending_session_req.take() else {
+        // Already started (or no request); activate may fire again after an
+        // EGFX reset, and the session outlives those.
+        return 1;
+    };
+    let mut session = match (state.open_session)(req) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let (tx, rx) = channel::<Frame>();
+    // Metadata-cursor relay: the backend publishes the latest SESSION-space
+    // cursor position into this slot; the mainloop forwards it newest-wins
+    // as PTR_POS_UPDATE. OFF BY DEFAULT (WAYRDP_POINTER_METADATA): the relay
+    // is half of Metadata mode — until the cursor SHAPE is also sent (and
+    // Hyprland's cursor on the captured output hidden), the client still
+    // draws its transparent painted-cursor shape, so the packet has no
+    // visible effect on mstsc/vmconnect, while FreeRDP clients WARP THE
+    // LOCAL CURSOR on PTR_POS_UPDATE: echoing injected motion back at wire
+    // latency makes the xfreerdp cursor fight the user's hand.
+    // Client-drawn cursor (WAYRDP_CLIENT_CURSOR): the client draws the
+    // compositor's cursor image itself, so the pointer moves at local speed
+    // and the video carries no cursor (no lag trail, no second pointer).
+    // Off by default until the T4 pointer tests pass on vmconnect.
+    let cursor_slot: Option<desk_backend::PointerShapeSlot> =
+        if std::env::var_os("WAYRDP_CLIENT_CURSOR").is_some() {
+            let slot: desk_backend::PointerShapeSlot =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            if session.set_pointer_shape_slot(slot.clone()) {
+                eprintln!("[peer_activate] client-drawn cursor on");
+                Some(slot)
+            } else {
+                eprintln!(
+                    "[peer_activate] backend cannot deliver cursor images; cursor stays painted"
+                );
+                None
+            }
+        } else {
+            None
+        };
+    // No position echo with a client-drawn cursor: the client already moves
+    // its own pointer, and FreeRDP clients warp on every PTR_POS_UPDATE.
+    let pos_slot: Option<desk_backend::PointerPositionSlot> =
+        if cursor_slot.is_none() && std::env::var_os("WAYRDP_POINTER_METADATA").is_some() {
+            let slot: desk_backend::PointerPositionSlot =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            session.set_pointer_position_slot(slot.clone());
+            Some(slot)
+        } else {
+            None
+        };
+
+    // e6: WinPR event signalled after every frame send so the mainloop's
+    // wait returns immediately on a new frame instead of at the next 16ms
+    // tick. The closure below is what the backend pump thread calls: it must
+    // only SetEvent (cheap, non-blocking) — never block the pump on the
+    // protocol thread.
+    (*ctx).frame_event = wayrdp_create_event();
+    if !(*ctx).frame_event.is_null() {
+        let ev = (*ctx).frame_event as usize;
+        let wake: desk_backend::FrameWake = std::sync::Arc::new(move || unsafe {
+            wayrdp_set_event(ev as HANDLE);
+        });
+        session.set_frame_wake(wake);
+    } else {
+        eprintln!("[peer_activate] frame event creation failed; falling back to frame polling");
+    }
+
+    if session.start(tx).is_err() {
+        eprintln!("[peer_activate] session.start failed");
+        return 0;
+    }
+    (*ctx).session = Some(session);
+    (*ctx).frame_rx = Some(rx);
+    (*ctx).pointer_pos_slot = pos_slot;
+    (*ctx).cursor_slot = cursor_slot;
+    eprintln!("[peer_activate] session started ok");
     1
 }
 
@@ -854,6 +895,13 @@ unsafe extern "C" fn peer_activate(client: *mut rdp_freerdp_peer) -> BOOL {
         eprintln!("[peer_activate] enter");
         let ctx = (*client).context as *mut PeerContext;
         (*ctx).activated = true;
+        // The backend session starts here, not at post_connect: see
+        // peer_post_connect_inner for the pre-activation accumulation
+        // rationale. Must precede the first pointer send so a client-drawn
+        // cursor slot is wired before any shape is forwarded.
+        if start_session(client, ctx) == 0 {
+            return 0;
+        }
         // First-send + re-send cadence: the client's pointer state resets on
         // EGFX reset / resize, so the transparent shape must go out after
         // activation and again from the frame loop.
@@ -1030,7 +1078,10 @@ mod eof_probe_tests {
     #[test]
     fn peek_unsupported_is_not_a_socket_error() {
         // Regression: hv_sock's EOPNOTSUPP tore down live vmconnect sessions.
-        assert_eq!(eof_peek_verdict(-1, libc::EOPNOTSUPP), EofPeek::PeekUnsupported);
+        assert_eq!(
+            eof_peek_verdict(-1, libc::EOPNOTSUPP),
+            EofPeek::PeekUnsupported
+        );
     }
 
     #[test]
@@ -1039,7 +1090,10 @@ mod eof_probe_tests {
         assert_eq!(eof_peek_verdict(0, 0), EofPeek::Eof);
         assert_eq!(eof_peek_verdict(-1, libc::EAGAIN), EofPeek::Alive);
         assert_eq!(eof_peek_verdict(-1, libc::EINTR), EofPeek::Alive);
-        assert_eq!(eof_peek_verdict(-1, libc::ECONNRESET), EofPeek::Error(libc::ECONNRESET));
+        assert_eq!(
+            eof_peek_verdict(-1, libc::ECONNRESET),
+            EofPeek::Error(libc::ECONNRESET)
+        );
     }
 
     #[test]
@@ -1047,10 +1101,19 @@ mod eof_probe_tests {
         let mut fds = [0i32; 2];
         // SAFETY: plain socketpair/write/close on fds owned by this test.
         unsafe {
-            assert_eq!(libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()), 0);
+            assert_eq!(
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()),
+                0
+            );
             assert!(!socket_hung_up(fds[0]), "idle, open peer");
-            assert_eq!(libc::write(fds[1], b"x".as_ptr() as *const libc::c_void, 1), 1);
-            assert!(!socket_hung_up(fds[0]), "pending data from an open peer is not a hangup");
+            assert_eq!(
+                libc::write(fds[1], b"x".as_ptr() as *const libc::c_void, 1),
+                1
+            );
+            assert!(
+                !socket_hung_up(fds[0]),
+                "pending data from an open peer is not a hangup"
+            );
             libc::close(fds[1]);
             assert!(socket_hung_up(fds[0]), "peer closed");
             libc::close(fds[0]);
@@ -1310,79 +1373,89 @@ unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
                     (*ctx).pointer_resend = true;
                 }
             }
+        }
 
-            // Drain all queued frames and only send the last one. F9: when
-            // the backend capture pipeline dies, its sender is dropped and
-            // try_iter would spin on an empty, dead channel forever — a
-            // frozen black screen. Surface Disconnected and drop the peer.
-            let Some(rx) = (*ctx).frame_rx.take() else {
-                continue;
-            };
-            let mut latest: Option<Frame> = None;
-            let mut drained: u64 = 0;
-            let mut backend_dead = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(f) => {
-                        latest = Some(f);
-                        drained += 1;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        backend_dead = true;
-                        break;
+        // Drain all queued frames and only send the last one. F9: when
+        // the backend capture pipeline dies, its sender is dropped and
+        // try_iter would spin on an empty, dead channel forever — a
+        // frozen black screen. Surface Disconnected and drop the peer.
+        // This runs whether or not the peer has activated: the drain
+        // bounds the channel to O(iteration) frames, so a producer that
+        // ever runs before Activate cannot accumulate unbounded memory
+        // (the session is opened in Activate; this is the belt to that
+        // braces).
+        let Some(rx) = (*ctx).frame_rx.take() else {
+            continue;
+        };
+        let mut latest: Option<Frame> = None;
+        let mut drained: u64 = 0;
+        let mut backend_dead = false;
+        loop {
+            match rx.try_recv() {
+                Ok(f) => {
+                    latest = Some(f);
+                    drained += 1;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    backend_dead = true;
+                    break;
+                }
+            }
+        }
+        (*ctx).frame_rx = Some(rx);
+        if backend_dead {
+            eprintln!("[peer_mainloop] backend frame producer gone; disconnecting peer");
+            break;
+        }
+        if !(*ctx).activated {
+            // Pre-activation frames are never sent: drop the newest-wins
+            // result and keep draining.
+            continue;
+        }
+        if let Some(t) = (*ctx).trace.as_mut() {
+            let now = now_mono_ms_u32();
+            if let Some(f) = latest.as_ref() {
+                t.on_dequeue(f.meta.capture_stamp_ms, drained - 1, now);
+            }
+            if let Some(line) = t.take_line(now) {
+                eprintln!("{line}");
+            }
+        }
+        if let Some(frame) = latest {
+            // e12: the frame's capture stamp lets us measure publish→
+            // encode-queue latency (unstamped frames: capture_stamp_ms=0).
+            let stamp = frame.meta.capture_stamp_ms;
+            if stamp != 0 {
+                let d = now_mono_ms_u32().wrapping_sub(stamp);
+                if std::env::var_os("WAYRDP_DEBUG_CAPTURE").is_some() {
+                    lat_n += 1;
+                    lat_sum += d as u64;
+                    lat_max = lat_max.max(d);
+                    lat_samples.push(d);
+                    if lat_last_log.elapsed().as_secs() >= 5 {
+                        lat_samples.sort_unstable();
+                        let p95 =
+                            lat_samples[(lat_samples.len() * 95 / 100).min(lat_samples.len() - 1)];
+                        eprintln!(
+                            "[gfx-lat] pub→enc_ms avg={} p95={} max={} over {}",
+                            lat_sum / lat_n,
+                            p95,
+                            lat_max,
+                            lat_n
+                        );
+                        lat_n = 0;
+                        lat_sum = 0;
+                        lat_max = 0;
+                        lat_samples.clear();
+                        lat_last_log = std::time::Instant::now();
                     }
                 }
             }
-            (*ctx).frame_rx = Some(rx);
-            if backend_dead {
-                eprintln!("[peer_mainloop] backend frame producer gone; disconnecting peer");
-                break;
-            }
-            if let Some(t) = (*ctx).trace.as_mut() {
-                let now = now_mono_ms_u32();
-                if let Some(f) = latest.as_ref() {
-                    t.on_dequeue(f.meta.capture_stamp_ms, drained - 1, now);
-                }
-                if let Some(line) = t.take_line(now) {
-                    eprintln!("{line}");
-                }
-            }
-            if let Some(frame) = latest {
-                // e12: the frame's capture stamp lets us measure publish→
-                // encode-queue latency (unstamped frames: capture_stamp_ms=0).
-                let stamp = frame.meta.capture_stamp_ms;
-                if stamp != 0 {
-                    let d = now_mono_ms_u32().wrapping_sub(stamp);
-                    if std::env::var_os("WAYRDP_DEBUG_CAPTURE").is_some() {
-                        lat_n += 1;
-                        lat_sum += d as u64;
-                        lat_max = lat_max.max(d);
-                        lat_samples.push(d);
-                        if lat_last_log.elapsed().as_secs() >= 5 {
-                            lat_samples.sort_unstable();
-                            let p95 = lat_samples
-                                [(lat_samples.len() * 95 / 100).min(lat_samples.len() - 1)];
-                            eprintln!(
-                                "[gfx-lat] pub→enc_ms avg={} p95={} max={} over {}",
-                                lat_sum / lat_n,
-                                p95,
-                                lat_max,
-                                lat_n
-                            );
-                            lat_n = 0;
-                            lat_sum = 0;
-                            lat_max = 0;
-                            lat_samples.clear();
-                            lat_last_log = std::time::Instant::now();
-                        }
-                    }
-                }
-                if (*ctx).gfx_ready && !(*ctx).rdpgfx.is_null() {
-                    send_frame_gfx(ctx, &frame);
-                } else {
-                    send_frame(client, ctx, &frame);
-                }
+            if (*ctx).gfx_ready && !(*ctx).rdpgfx.is_null() {
+                send_frame_gfx(ctx, &frame);
+            } else {
+                send_frame(client, ctx, &frame);
             }
         }
     }
