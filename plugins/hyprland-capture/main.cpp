@@ -125,12 +125,17 @@ struct Target {
         } else {
             shmPath[0] = '\0';
             curPath[0] = '\0';
+            sockPath[0] = '\0';
         }
         // Frame-notify datagram target (best-effort; nothing binds it yet).
-        // Same user-private runtime dir.
-        const char* base = (rt && *rt) ? rt : "/tmp";
-        std::snprintf(sockPath, sizeof(sockPath),
-                      "%s/wayrdp-capture-%s.sock", base, monName.c_str());
+        // Same user-private runtime dir — no /tmp fallback: an empty
+        // sockPath simply disables the notify fast-path (sockNotify's
+        // sendto fails and the reader polls), which is the same rule the
+        // segments follow.
+        if (rt && *rt) {
+            std::snprintf(sockPath, sizeof(sockPath),
+                          "%s/wayrdp-capture-%s.sock", rt, monName.c_str());
+        }
     }
     Target(const Target&) = delete;
     Target& operator=(const Target&) = delete;
@@ -355,8 +360,17 @@ static bool shmSetup(Target& t, uint32_t w, uint32_t h) {
     int fd = shmCreateOwned(t.shmPath);
     if (fd < 0)
         return false;
-    if (ftruncate(fd, (off_t)need) != 0) {
-        Log::logger->log(Log::ERR, "[wayrdp-capture] ftruncate failed: {}", strerror(errno));
+    // Commit the pages NOW, not on first write. The runtime dir is a size-
+    // capped tmpfs (logind defaults RuntimeDirectorySize to 10% of RAM, vs
+    // ~50% for /dev/shm): ftruncate only sets the size and succeeds past
+    // the cap, and the ENOSPC would otherwise surface later as a SIGBUS
+    // while the plugin writes pixels — inside Hyprland's process, killing
+    // the compositor. posix_fallocate turns that into a clean setup-time
+    // failure we can log and leave to the daemon's ext-image-copy fallback.
+    if (ftruncate(fd, (off_t)need) != 0 || posix_fallocate(fd, 0, (off_t)need) != 0) {
+        Log::logger->log(Log::ERR,
+                         "[wayrdp-capture] allocating {} bytes failed (runtime dir full?): {}",
+                         need, strerror(errno));
         close(fd);
         unlink(t.shmPath);
         return false;
@@ -413,8 +427,13 @@ static bool cursorShmSetup(Target& t) {
     int fd = shmCreateOwned(t.curPath);
     if (fd < 0)
         return false;
-    if (ftruncate(fd, (off_t)CURSOR_SHM_SIZE) != 0) {
-        Log::logger->log(Log::ERR, "[wayrdp-capture] cursor ftruncate failed: {}", strerror(errno));
+    // Same as shmSetup: commit the pages at setup so a full runtime dir is
+    // a clean error here, never a SIGBUS in the render path.
+    if (ftruncate(fd, (off_t)CURSOR_SHM_SIZE) != 0 ||
+        posix_fallocate(fd, 0, (off_t)CURSOR_SHM_SIZE) != 0) {
+        Log::logger->log(Log::ERR,
+                         "[wayrdp-capture] cursor segment alloc failed (runtime dir full?): {}",
+                         strerror(errno));
         close(fd);
         unlink(t.curPath);
         return false;
@@ -524,7 +543,7 @@ static void sockSetup() {
 }
 
 static void sockNotify(Target& t) {
-    if (g_sockFd < 0)
+    if (g_sockFd < 0 || !t.sockPath[0])
         return;
     struct sockaddr_un addr {};
     addr.sun_family = AF_UNIX;

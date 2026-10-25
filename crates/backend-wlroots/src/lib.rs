@@ -2277,12 +2277,21 @@ fn plugin_supports_client_cursor(hdr_size: usize, header: &[u8]) -> bool {
 /// `$XDG_RUNTIME_DIR` — tmpfs (so mmap gives the same shared-memory
 /// semantics as /dev/shm) but 0700 and owned by the session user, so a
 /// different local user cannot pre-create the name (the /dev/shm squat
-/// denial-of-service). The plugin derives the identical path. None (and a
-/// logged refusal) when no runtime dir is set: there is no safe
-/// world-writable fallback, and a Wayland session without one cannot host
-/// capture anyway.
+/// denial-of-service). The plugin derives the identical path. None when no
+/// runtime dir is set: there is no safe world-writable fallback, and a
+/// Wayland session without one cannot host capture anyway.
 fn shm_segment_path(kind: &str, output_name: &str) -> Option<std::path::PathBuf> {
     let rt = std::env::var_os("XDG_RUNTIME_DIR")?;
+    segment_path_in(&rt, kind, output_name)
+}
+
+/// [`shm_segment_path`] with the runtime dir as a parameter (test seam —
+/// tests must not mutate the process env, which other parallel tests read).
+fn segment_path_in(
+    rt: &std::ffi::OsStr,
+    kind: &str,
+    output_name: &str,
+) -> Option<std::path::PathBuf> {
     if rt.is_empty() {
         return None;
     }
@@ -3952,26 +3961,21 @@ mod tests {
         // Segments moved out of /dev/shm (mode 1777, listable: any local
         // user could read a name suffix and pre-create the next one) into
         // the 0700 user-owned runtime dir, where cross-user squatting is
-        // impossible. The plugin derives the identical path.
-        let rt = "/run/user/1000";
-        let saved = std::env::var_os("XDG_RUNTIME_DIR");
-        // SAFETY: test-only env mutation; this crate is edition 2021 and
-        // the two assertions below run in this test alone.
-        std::env::set_var("XDG_RUNTIME_DIR", rt);
+        // impossible. The plugin derives the identical path. The param-
+        // taking helper avoids mutating the process env (parallel tests).
+        let rt = std::ffi::OsStr::new("/run/user/1000");
         assert_eq!(
-            super::shm_segment_path("capture", "wayrdp-7"),
-            Some(format!("{rt}/wayrdp-capture-wayrdp-7").into())
+            super::segment_path_in(rt, "capture", "wayrdp-7"),
+            Some(format!("{}/wayrdp-capture-wayrdp-7", rt.to_str().unwrap()).into())
         );
         assert_eq!(
-            super::shm_segment_path("cursor", "wayrdp-7"),
-            Some(format!("{rt}/wayrdp-cursor-wayrdp-7").into())
+            super::segment_path_in(rt, "cursor", "wayrdp-7"),
+            Some(format!("{}/wayrdp-cursor-wayrdp-7", rt.to_str().unwrap()).into())
         );
-        std::env::set_var("XDG_RUNTIME_DIR", "");
-        assert_eq!(super::shm_segment_path("capture", "wayrdp-7"), None);
-        match saved {
-            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
-        }
+        assert_eq!(
+            super::segment_path_in(std::ffi::OsStr::new(""), "capture", "wayrdp-7"),
+            None
+        );
     }
 
     #[test]
