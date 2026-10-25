@@ -74,6 +74,11 @@ static Hyprutils::Signal::CHyprSignalListener g_onCursorChanged;
 
 static std::string  g_targetPrefix = "wayrdp";
 static bool         g_inWayrdpMon  = false;
+
+// How long a Target sits out after a failed segment setup (full runtime
+// dir): the render path retries at most once per window instead of once
+// per frame, so a full tmpfs is not hammered ~60x/s from inside Hyprland.
+static constexpr uint64_t SETUP_RETRY_BACKOFF_MS = 3000;
 static PHLMONITOR   g_currentMon   = nullptr;
 
 // Per-monitor capture target. Paths are keyed by monitor name: two
@@ -106,6 +111,16 @@ struct Target {
     char     shmPath[256];
     char     curPath[256];
     char     sockPath[256];
+    // Backoff after a failed segment setup (full runtime dir etc.):
+    // captureFrame runs ~60x/s inside Hyprland's render thread, and each
+    // retry would re-create the file and re-run posix_fallocate for up to
+    // tens of MB of tmpfs pages before failing — refilling the runtime dir
+    // to its cap and starving everything else under /run/user/$UID. After
+    // a failure we skip setup for this monitor until the deadline passes
+    // or the geometry changes. retryW/H remember the geometry the failure
+    // belongs to so a size change retries immediately.
+    uint64_t setupRetryAtMs = 0;
+    uint32_t retryW = 0, retryH = 0;
 
     Target(const std::string& monName) {
         // Segments live under XDG_RUNTIME_DIR (tmpfs, 0700, user-owned):
@@ -351,6 +366,12 @@ static bool shmSetup(Target& t, uint32_t w, uint32_t h) {
     size_t need = HEADER_SIZE + 2 * size_t(w) * h * 4;
     if (t.shmPtr && t.frameW == w && t.frameH == h)
         return true;
+    // Backoff guard (see Target::setupRetryAtMs): a failed setup must not
+    // retry on every rendered frame. A geometry change resets it.
+    const uint64_t now = nowMonoMs();
+    if (t.setupRetryAtMs != 0 && now < t.setupRetryAtMs && t.retryW == w && t.retryH == h)
+        return false;
+    t.setupRetryAtMs = 0;
 
     // The reader's cursor request outlives a resize: it re-asserts only when
     // it reopens, and until then the cursor would be drawn twice.
@@ -358,21 +379,37 @@ static bool shmSetup(Target& t, uint32_t w, uint32_t h) {
     shmTeardown(t);
 
     int fd = shmCreateOwned(t.shmPath);
-    if (fd < 0)
+    if (fd < 0) {
+        // Any setup failure takes the backoff (covers the no-runtime-dir
+        // refusal too, so its ERR fires once per window, not per frame).
+        t.setupRetryAtMs = now + SETUP_RETRY_BACKOFF_MS;
+        t.retryW = w;
+        t.retryH = h;
         return false;
+    }
     // Commit the pages NOW, not on first write. The runtime dir is a size-
     // capped tmpfs (logind defaults RuntimeDirectorySize to 10% of RAM, vs
     // ~50% for /dev/shm): ftruncate only sets the size and succeeds past
     // the cap, and the ENOSPC would otherwise surface later as a SIGBUS
     // while the plugin writes pixels — inside Hyprland's process, killing
     // the compositor. posix_fallocate turns that into a clean setup-time
-    // failure we can log and leave to the daemon's ext-image-copy fallback.
-    if (ftruncate(fd, (off_t)need) != 0 || posix_fallocate(fd, 0, (off_t)need) != 0) {
+    // failure we log once and back off from (the reader side keeps
+    // polling; a session that wants video can restart with the default
+    // ext-image-copy capture).
+    // ftruncate sets errno and returns -1; posix_fallocate returns the
+    // error number itself — normalize to an errno value for strerror.
+    int rc = ftruncate(fd, (off_t)need) ? errno : 0;
+    if (rc == 0)
+        rc = posix_fallocate(fd, 0, (off_t)need);
+    if (rc != 0) {
         Log::logger->log(Log::ERR,
-                         "[wayrdp-capture] allocating {} bytes failed (runtime dir full?): {}",
-                         need, strerror(errno));
+                         "[wayrdp-capture] allocating {} bytes for {} failed (runtime dir full?): {}",
+                         need, t.shmPath, strerror(rc));
         close(fd);
         unlink(t.shmPath);
+        t.setupRetryAtMs = now + SETUP_RETRY_BACKOFF_MS;
+        t.retryW = w;
+        t.retryH = h;
         return false;
     }
     void* p = mmap(nullptr, need, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -380,6 +417,9 @@ static bool shmSetup(Target& t, uint32_t w, uint32_t h) {
         Log::logger->log(Log::ERR, "[wayrdp-capture] mmap failed: {}", strerror(errno));
         close(fd);
         unlink(t.shmPath);
+        t.setupRetryAtMs = now + SETUP_RETRY_BACKOFF_MS;
+        t.retryW = w;
+        t.retryH = h;
         return false;
     }
 
@@ -428,12 +468,16 @@ static bool cursorShmSetup(Target& t) {
     if (fd < 0)
         return false;
     // Same as shmSetup: commit the pages at setup so a full runtime dir is
-    // a clean error here, never a SIGBUS in the render path.
-    if (ftruncate(fd, (off_t)CURSOR_SHM_SIZE) != 0 ||
-        posix_fallocate(fd, 0, (off_t)CURSOR_SHM_SIZE) != 0) {
+    // a clean error here, never a SIGBUS in the render path. (This runs on
+    // cursor-change events, not per frame, so no backoff is needed.)
+    // ftruncate sets errno/-1; posix_fallocate returns the error number.
+    int rc = ftruncate(fd, (off_t)CURSOR_SHM_SIZE) ? errno : 0;
+    if (rc == 0)
+        rc = posix_fallocate(fd, 0, (off_t)CURSOR_SHM_SIZE);
+    if (rc != 0) {
         Log::logger->log(Log::ERR,
                          "[wayrdp-capture] cursor segment alloc failed (runtime dir full?): {}",
-                         strerror(errno));
+                         strerror(rc));
         close(fd);
         unlink(t.curPath);
         return false;
@@ -818,11 +862,8 @@ static void captureFrame(const PHLMONITOR& mon, GLint readFb, const FrameRect* f
                          mon->m_name);
 
     if (!shmSetup(t, w, h)) {
-        // Log throttled, do not kill the renderer with repeated setup costs.
-        static uint64_t logCnt = 0;
-        if (++logCnt % 600 == 1)
-            Log::logger->log(Log::ERR,
-                             "[wayrdp-capture] shmSetup failed (count={})", logCnt);
+        // shmSetup logged the failure (once per backoff window) and set
+        // the backoff; nothing to add per frame.
         return;
     }
     sockSetup();

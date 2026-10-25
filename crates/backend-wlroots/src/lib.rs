@@ -3460,6 +3460,10 @@ impl Drop for FrameNotify {
     }
 }
 
+/// How long pump_loop_shm waits for the plugin's segment before logging
+/// (once) that it never appeared and no frames will flow in this mode.
+const SHM_APPEAR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Pump loop for WAYRDP_CAPTURE=shm-plugin: replaces ext-image-copy with
 /// direct reads from the hyprland-capture plugin's shm. Still owns the
 /// wayrdp-N headless output lifecycle and virtual input.
@@ -3559,6 +3563,11 @@ fn pump_loop_shm(
     let mut cursor_requested = false;
     let mut cursor_unsupported_logged = false;
     let mut shm_nowhere_logged = false;
+    // Deadline for the plugin's segment to appear before we log (once) that
+    // no frames will flow in this mode. Reset on every successful open so
+    // a mid-session reopen (resize) doesn't trip a stale deadline.
+    let mut shm_wait_start = std::time::Instant::now();
+    let mut shm_never_logged = false;
     let mut plugin_cursor: Option<PluginCursor> = None;
     let mut cursor_open_at = std::time::Instant::now();
 
@@ -3689,11 +3698,34 @@ fn pump_loop_shm(
                         }
                     }
                     shm = Some(s);
+                    shm_wait_start = std::time::Instant::now();
+                    shm_never_logged = false;
                 }
                 Some(None) => {
                     // Plugin hasn't created the segment yet. Give it some
                     // time to appear (it only spawns when Hyprland renders
-                    // a wayrdp monitor after plugin load).
+                    // a wayrdp monitor after plugin load) — but not forever:
+                    // WAYRDP_CAPTURE=shm-plugin with no segment (plugin not
+                    // loaded, not rebuilt for the runtime-dir layout, or its
+                    // setup is failing on a full runtime dir) would
+                    // otherwise sit here forever with the client on a black
+                    // screen. There is no automatic fallback to
+                    // ext-image-copy from inside this loop; after the
+                    // deadline we say exactly that and keep retrying.
+                    if shm_wait_start.elapsed() >= SHM_APPEAR_DEADLINE && !shm_never_logged {
+                        shm_never_logged = true;
+                        eprintln!(
+                            "[backend-wlroots] capture segment {} never appeared after {}s; no frames will flow. \
+                             Plugin not loaded/not rebuilt (segments moved to $XDG_RUNTIME_DIR), \
+                             or its setup is failing (full runtime dir?). \
+                             Continuing to retry; restart the session without WAYRDP_CAPTURE=shm-plugin \
+                             for the ext-image-copy path.",
+                            ShmCapture::path_for(&state.output_name)
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "<no runtime dir>".into()),
+                            SHM_APPEAR_DEADLINE.as_secs()
+                        );
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     continue 'main;
                 }
