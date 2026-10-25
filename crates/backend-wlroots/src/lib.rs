@@ -3564,9 +3564,11 @@ fn pump_loop_shm(
     let mut cursor_unsupported_logged = false;
     let mut shm_nowhere_logged = false;
     // Deadline for the plugin's segment to appear before we log (once) that
-    // no frames will flow in this mode. Reset on every successful open so
-    // a mid-session reopen (resize) doesn't trip a stale deadline.
-    let mut shm_wait_start = std::time::Instant::now();
+    // no frames will flow in this mode. Armed on the FIRST miss and cleared
+    // on every successful open, so the clock measures how long the CURRENT
+    // wait has lasted — a resize or stale-reopen that drops `shm` starts a
+    // fresh wait and can never trip a stale deadline.
+    let mut shm_wait_start: Option<std::time::Instant> = None;
     let mut shm_never_logged = false;
     let mut plugin_cursor: Option<PluginCursor> = None;
     let mut cursor_open_at = std::time::Instant::now();
@@ -3698,7 +3700,7 @@ fn pump_loop_shm(
                         }
                     }
                     shm = Some(s);
-                    shm_wait_start = std::time::Instant::now();
+                    shm_wait_start = None;
                     shm_never_logged = false;
                 }
                 Some(None) => {
@@ -3712,7 +3714,11 @@ fn pump_loop_shm(
                     // screen. There is no automatic fallback to
                     // ext-image-copy from inside this loop; after the
                     // deadline we say exactly that and keep retrying.
-                    if shm_wait_start.elapsed() >= SHM_APPEAR_DEADLINE && !shm_never_logged {
+                    // The wait clock arms on this first miss, so a resize
+                    // or stale-reopen that dropped a healthy segment starts
+                    // a fresh 30s wait instead of tripping an old one.
+                    let waited = *shm_wait_start.get_or_insert_with(std::time::Instant::now);
+                    if waited.elapsed() >= SHM_APPEAR_DEADLINE && !shm_never_logged {
                         shm_never_logged = true;
                         eprintln!(
                             "[backend-wlroots] capture segment {} never appeared after {}s; no frames will flow. \
