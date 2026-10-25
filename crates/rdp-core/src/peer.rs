@@ -145,6 +145,9 @@ pub struct PeerContext {
     /// path. Box-allocated to keep PeerContext cheap to calloc; None until
     /// the first send_frame_gfx allocates it.
     pub prev_frame_pixels: Option<Box<[u8]>>,
+    /// Frame pipeline trace (WAYRDP_TRACE); None when off. calloc-zero is a
+    /// valid None.
+    pub trace: Option<Box<crate::trace::FrameTrace>>,
 }
 
 /// Global listener state, boxed and passed via `listener->info` so
@@ -528,6 +531,7 @@ unsafe fn peer_context_new_inner(ctx: *mut rdpContext) -> BOOL {
     ptr::write(&mut (*ctx).cursor_last, None);
     (*ctx).damage_full_frames = 0;
     ptr::write(&mut (*ctx).prev_frame_pixels, None);
+    ptr::write(&mut (*ctx).trace, None);
     ptr::write(&mut (*ctx).pending_ack, None);
     ptr::write(&mut (*ctx).disp_req, std::sync::Mutex::new(None));
     ptr::write(&mut (*ctx).cliprdr, None);
@@ -599,6 +603,7 @@ unsafe fn peer_context_free_inner(ctx: *mut rdpContext) {
     (*ctx).session = None;
     eprintln!("[peer_context_free_inner] teardown: session dropped");
     (*ctx).prev_frame_pixels = None;
+    (*ctx).trace = None;
     if !(*ctx).frame_event.is_null() {
         wayrdp_close_handle((*ctx).frame_event);
         (*ctx).frame_event = ptr::null_mut();
@@ -1070,6 +1075,9 @@ unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
     let mut last_eof_probe = std::time::Instant::now() - std::time::Duration::from_secs(2);
     // Wall-clock anchor for the activation deadline (fix 4).
     let loop_start = std::time::Instant::now();
+    if crate::trace::enabled() {
+        (*ctx).trace = Some(Box::new(crate::trace::FrameTrace::new(now_mono_ms_u32())));
+    }
     loop {
         iter = iter.wrapping_add(1);
         let mut handles: [HANDLE; 64] = [ptr::null_mut(); 64];
@@ -1311,10 +1319,14 @@ unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
                 continue;
             };
             let mut latest: Option<Frame> = None;
+            let mut drained: u64 = 0;
             let mut backend_dead = false;
             loop {
                 match rx.try_recv() {
-                    Ok(f) => latest = Some(f),
+                    Ok(f) => {
+                        latest = Some(f);
+                        drained += 1;
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         backend_dead = true;
@@ -1326,6 +1338,15 @@ unsafe fn peer_mainloop(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) {
             if backend_dead {
                 eprintln!("[peer_mainloop] backend frame producer gone; disconnecting peer");
                 break;
+            }
+            if let Some(t) = (*ctx).trace.as_mut() {
+                let now = now_mono_ms_u32();
+                if let Some(f) = latest.as_ref() {
+                    t.on_dequeue(f.meta.capture_stamp_ms, drained - 1, now);
+                }
+                if let Some(line) = t.take_line(now) {
+                    eprintln!("{line}");
+                }
             }
             if let Some(frame) = latest {
                 // e12: the frame's capture stamp lets us measure publish→
@@ -1640,6 +1661,9 @@ unsafe extern "C" fn peer_rdpgfx_frame_acknowledge(
             // (MS-RDPEGFX 2.2.3.10) or the pipeline freezes at 4 frames.
             (*ctx).gfx_ack_suspended = true;
         }
+        if let Some(t) = (*ctx).trace.as_mut() {
+            t.on_ack((*pdu).frameId, (*pdu).queueDepth, now_mono_ms_u32());
+        }
         (*ctx).gfx_frames_acked = (*ctx).gfx_frames_acked.wrapping_add(1);
         // Acks for frames sent before a CapsConfirm reset would push acked
         // above sent; saturating_sub hides that by leaving the window
@@ -1820,6 +1844,9 @@ fn send_frame_gfx(ctx: *mut PeerContext, frame: &Frame) {
                         (*ctx).gfx_frames_acked,
                         waited
                     );
+                }
+                if let Some(t) = (*ctx).trace.as_mut() {
+                    t.on_gated();
                 }
                 return; // client owes us acks; wait
             }
@@ -2045,6 +2072,12 @@ fn send_frame_gfx(ctx: *mut PeerContext, frame: &Frame) {
         (*ctx).frame_id = (*ctx).frame_id.wrapping_add(1);
         (*ctx).gfx_frames_sent = (*ctx).gfx_frames_sent.wrapping_add(1);
         // gfx_frames_acked is advanced by each FrameAcknowledge PDU.
+        if let Some(t) = (*ctx).trace.as_mut() {
+            let inflight = (*ctx)
+                .gfx_frames_sent
+                .saturating_sub((*ctx).gfx_frames_acked);
+            t.on_sent(fid, encode_ms as u32, inflight, now_mono_ms_u32());
+        }
     }
 }
 

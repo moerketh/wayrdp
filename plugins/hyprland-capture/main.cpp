@@ -8,8 +8,9 @@
 // At 1920x1200 llvmpipe that's ~40ms per request, capping fps at ~25.
 //
 // This plugin instead hooks Hyprland's own per-monitor render path at
-// RENDER_LAST_MOMENT (GL context still bound). We glReadPixels from the
-// already-painted output FBO into a memfd, then notify via a Unix
+// RENDER_LAST_MOMENT (arm) and CHyprGLRenderer::endRender (GL context still
+// bound, the frame's pass executed — see e9). We glReadPixels from the
+// painted output FBO into a memfd, then notify via a Unix
 // datagram socket. wayrdp consumes the shm.
 //
 // Cost per frame: one FB readPixels (~1-3ms) vs 40ms for fake render.
@@ -20,9 +21,12 @@
 #include <hyprland/src/helpers/Color.hpp>
 #include <hyprland/src/helpers/memory/Memory.hpp>
 #include <hyprland/src/output/DamageRing.hpp>
+#include <hyprland/src/plugins/HookSystem.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/render/gl/GLFramebuffer.hpp>
 #include <hyprland/src/version.h>
 
 #include <hyprutils/math/Region.hpp>
@@ -31,6 +35,7 @@
 #include <hyprutils/memory/WeakPtr.hpp>
 
 #include <GLES3/gl32.h>
+#include <drm_fourcc.h>
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -40,8 +45,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -62,6 +70,7 @@ inline HANDLE g_pHandle = nullptr;
 static Hyprutils::Signal::CHyprSignalListener g_onRenderStage;
 static Hyprutils::Signal::CHyprSignalListener g_onRenderPre;
 static Hyprutils::Signal::CHyprSignalListener g_onMonitorDestroy;
+static Hyprutils::Signal::CHyprSignalListener g_onCursorChanged;
 
 static std::string  g_targetPrefix = "wayrdp";
 static bool         g_inWayrdpMon  = false;
@@ -86,12 +95,23 @@ struct Target {
     uint32_t writeSlot = 0;
     uint64_t publishedSeq[2] = {0, 0};
     uint64_t dropSlotBusy  = 0; // stats: reader held a bank past 8ms budget
+    // Client-drawn cursor as last seen in the header; a change repaints the
+    // whole output so no stale painted cursor stays behind in the frame.
+    bool     clientCursor = false;
+    // Cursor image shm (client-drawn cursor), independent of the frame
+    // geometry: it lives until the monitor goes away.
+    int      curFd  = -1;
+    void*    curPtr = nullptr;
+    uint64_t curSeq = 0;
     char     shmPath[256];
+    char     curPath[256];
     char     sockPath[256];
 
     Target(const std::string& monName) {
         std::snprintf(shmPath, sizeof(shmPath),
                       "/wayrdp-capture-%s", monName.c_str());
+        std::snprintf(curPath, sizeof(curPath),
+                      "/wayrdp-cursor-%s", monName.c_str());
         // Frame-notify datagram target (best-effort; nothing binds it yet).
         // Under XDG_RUNTIME_DIR — a user-private dir — not world-writable
         // /tmp, so a local user can't pre-create squatting paths.
@@ -105,6 +125,8 @@ struct Target {
 };
 
 static std::unordered_map<std::string, Target> g_targets;
+
+static bool g_cursorHooked = false; // both client-cursor hooks are live
 
 static int          g_sockFd      = -1;
 static uint64_t     g_frameSeq    = 0;
@@ -168,11 +190,18 @@ static const uint32_t SHM_MAGIC   = 0x57524343u;
 //           writer-to-reader channel. Monotonic; the words persist across
 //           reader restarts, which is exactly what keeps a reconnected
 //           wayrdp from deadlocking the plugin.
+//   caps:   what this plugin build supports (CAP_* bits), stamped with
+//           every frame so a reader can tell an old .so from a new one.
+//   cursorReq: CURSOR_REQ_CLIENT = the reader's client draws the cursor
+//           itself; Hyprland's software cursor is then left out of this
+//           output's frames. READER-written, anything else = painted.
 struct HdrTail {
     uint32_t active;        // @160, plugin-written
     uint32_t tailPad;       // @164, 8-byte alignment
     uint64_t releasedSeq[2];// @168/@176, READER-written (reader pwrite)
-    uint8_t  reserved[256 - 184];
+    uint32_t caps;          // @184, plugin-written
+    uint32_t cursorReq;     // @188, READER-written (reader pwrite)
+    uint8_t  reserved[256 - 192];
 };
 static_assert(sizeof(HdrTail) + sizeof(FrameHeader) == 256,
               "e8 v2 header must be 256 bytes (offsets are a wire format)");
@@ -183,6 +212,38 @@ static_assert(sizeof(HdrTail) + sizeof(FrameHeader) == 256,
 // change one side without the other.
 static const size_t HEADER_SIZE = 256;
 
+static const uint32_t CAP_CLIENT_CURSOR = 1u << 0;
+static const uint32_t CURSOR_REQ_CLIENT = 0x52534355u; // "UCSR"
+
+// Cursor image shm (/wayrdp-cursor-<mon>): Hyprland's current cursor image,
+// rewritten on every cursor change while the reader's client draws the
+// cursor. Pixels are the cursor buffer's ARGB8888 rows (premultiplied, as
+// Wayland shm cursors are), tightly packed, right after the 64-byte header.
+// seq is a seqlock like the frame header's. Hidden cursor = visible 0.
+struct CursorHeader {
+    uint32_t magic;   // CURSOR_MAGIC
+    uint32_t version; // 1
+    uint64_t seq;     // odd = write in progress
+    uint32_t width;
+    uint32_t height;
+    int32_t  hotX;
+    int32_t  hotY;
+    uint32_t visible;
+    uint32_t srcWidth;  // cursor buffer size before scaling (diagnostic)
+    uint32_t srcHeight;
+    uint32_t scale100;  // cursor buffer scale x100 (diagnostic)
+    uint8_t  pad[64 - 48];
+};
+static_assert(sizeof(CursorHeader) == 64, "cursor header is a wire format");
+static const uint32_t CURSOR_MAGIC    = 0x57435552u; // "RUCW" on the wire
+static const uint32_t CURSOR_MAX      = 256;         // larger cursors keep the last shape
+static const size_t   CURSOR_SHM_SIZE = sizeof(CursorHeader) + size_t(CURSOR_MAX) * CURSOR_MAX * 4;
+
+static HdrTail* tailOf(const Target& t) {
+    return reinterpret_cast<HdrTail*>(reinterpret_cast<char*>(t.shmPtr) +
+                                      sizeof(FrameHeader));
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -192,6 +253,7 @@ static bool isWayrdpMonitor(const PHLMONITOR& m) {
 }
 
 static void shmTeardown(Target& t);
+static void cursorShmTeardown(Target& t);
 
 static void onMonitorDestroy(PHLMONITOR m) {
     if (!isWayrdpMonitor(m))
@@ -205,6 +267,7 @@ static void onMonitorDestroy(PHLMONITOR m) {
                      "[wayrdp-capture] monitor {} destroyed; tearing down {} shm",
                      m->m_name, t->second.shmPath);
     shmTeardown(t->second);
+    cursorShmTeardown(t->second);
     g_targets.erase(t);
 }
 
@@ -223,6 +286,36 @@ static void shmTeardown(Target& t) {
     t.frameH  = 0;
 }
 
+// Create `path` exclusively; returns the fd or -1.
+static int shmCreateOwned(const char* path) {
+    int fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0)
+        return fd;
+    // Stale shm from a previous plugin run? Take it over so the new
+    // instance owns a fresh file. Ownership-gated: anything not owned by
+    // us is treated as a hard failure, never silently unlinked.
+    // /dev/shm can contain symlinks (POSIX shm objects are tmpfs files);
+    // O_NOFOLLOW refuses them outright so the uid check below can never
+    // be satisfied by a link we followed. (S_ISLNK on an fstat result is
+    // structurally impossible — fstat reports the target — so it's gone.)
+    fd = shm_open(path, O_RDWR | O_NOFOLLOW, 0600);
+    struct stat st {};
+    if (fd < 0 || fstat(fd, &st) < 0 || st.st_uid != getuid()) {
+        if (fd >= 0)
+            close(fd);
+        Log::logger->log(Log::ERR,
+                         "[wayrdp-capture] shm {} exists and is not ours; refusing takeover",
+                         path);
+        return -1;
+    }
+    close(fd);
+    shm_unlink(path);
+    fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0)
+        Log::logger->log(Log::ERR, "[wayrdp-capture] shm_open failed: {}", strerror(errno));
+    return fd;
+}
+
 static bool shmSetup(Target& t, uint32_t w, uint32_t h) {
     // e8: TWO pixel banks behind a 256-byte header. The plugin always
     // writes the idle bank and publishes its index; the reader hands the
@@ -232,35 +325,14 @@ static bool shmSetup(Target& t, uint32_t w, uint32_t h) {
     if (t.shmPtr && t.frameW == w && t.frameH == h)
         return true;
 
+    // The reader's cursor request outlives a resize: it re-asserts only when
+    // it reopens, and until then the cursor would be drawn twice.
+    const uint32_t cursorReq = t.shmPtr ? tailOf(t)->cursorReq : 0;
     shmTeardown(t);
 
-    int fd = shm_open(t.shmPath, O_RDWR | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) {
-        // Stale shm from a previous plugin run? Take it over so the new
-        // instance owns a fresh file. Ownership-gated: anything not owned by
-        // us is treated as a hard failure, never silently unlinked.
-        // /dev/shm can contain symlinks (POSIX shm objects are tmpfs files);
-        // O_NOFOLLOW refuses them outright so the uid check below can never
-        // be satisfied by a link we followed. (S_ISLNK on an fstat result is
-        // structurally impossible — fstat reports the target — so it's gone.)
-        fd = shm_open(t.shmPath, O_RDWR | O_NOFOLLOW, 0600);
-        struct stat st {};
-        if (fd < 0 || fstat(fd, &st) < 0 || st.st_uid != getuid()) {
-            if (fd >= 0)
-                close(fd);
-            Log::logger->log(Log::ERR,
-                             "[wayrdp-capture] shm {} exists and is not ours; refusing takeover",
-                             t.shmPath);
-            return false;
-        }
-        close(fd);
-        shm_unlink(t.shmPath);
-        fd = shm_open(t.shmPath, O_RDWR | O_CREAT | O_EXCL, 0600);
-        if (fd < 0) {
-            Log::logger->log(Log::ERR, "[wayrdp-capture] shm_open failed: {}", strerror(errno));
-            return false;
-        }
-    }
+    int fd = shmCreateOwned(t.shmPath);
+    if (fd < 0)
+        return false;
     if (ftruncate(fd, (off_t)need) != 0) {
         Log::logger->log(Log::ERR, "[wayrdp-capture] ftruncate failed: {}", strerror(errno));
         close(fd);
@@ -280,6 +352,8 @@ static bool shmSetup(Target& t, uint32_t w, uint32_t h) {
     // non-zero word would stall the first two publishes by up to 16ms.
     std::memset(reinterpret_cast<char*>(p) + sizeof(FrameHeader), 0,
                 HEADER_SIZE - sizeof(FrameHeader));
+    reinterpret_cast<HdrTail*>(reinterpret_cast<char*>(p) + sizeof(FrameHeader))
+        ->cursorReq = cursorReq;
 
     t.shmFd   = fd;
     t.shmPtr  = p;
@@ -295,6 +369,122 @@ static bool shmSetup(Target& t, uint32_t w, uint32_t h) {
     Log::logger->log(Log::INFO,
                      "[wayrdp-capture] shm setup {}x{} ({} bytes) on {}",
                      w, h, need, t.shmPath);
+    return true;
+}
+
+static void cursorShmTeardown(Target& t) {
+    if (t.curPtr) {
+        munmap(t.curPtr, CURSOR_SHM_SIZE);
+        t.curPtr = nullptr;
+    }
+    if (t.curFd >= 0) {
+        close(t.curFd);
+        t.curFd = -1;
+        shm_unlink(t.curPath);
+    }
+}
+
+static bool cursorShmSetup(Target& t) {
+    if (t.curPtr)
+        return true;
+    int fd = shmCreateOwned(t.curPath);
+    if (fd < 0)
+        return false;
+    if (ftruncate(fd, (off_t)CURSOR_SHM_SIZE) != 0) {
+        Log::logger->log(Log::ERR, "[wayrdp-capture] cursor ftruncate failed: {}", strerror(errno));
+        close(fd);
+        shm_unlink(t.curPath);
+        return false;
+    }
+    void* p = mmap(nullptr, CURSOR_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        Log::logger->log(Log::ERR, "[wayrdp-capture] cursor mmap failed: {}", strerror(errno));
+        close(fd);
+        shm_unlink(t.curPath);
+        return false;
+    }
+    t.curFd  = fd;
+    t.curPtr = p;
+    t.curSeq = 0;
+    return true;
+}
+
+// Box-filter premultiplied ARGB8888 rows from sw x sh down to dw x dh
+// (dw <= sw, dh <= sh). XRGB sources count as opaque.
+static void downscaleCursor(const uint8_t* src, size_t stride, uint32_t sw, uint32_t sh,
+                            bool opaque, uint8_t* dst, uint32_t dw, uint32_t dh) {
+    for (uint32_t dy = 0; dy < dh; dy++) {
+        const uint32_t y0 = dy * sh / dh, y1 = std::max(y0 + 1, (dy + 1) * sh / dh);
+        for (uint32_t dx = 0; dx < dw; dx++) {
+            const uint32_t x0 = dx * sw / dw, x1 = std::max(x0 + 1, (dx + 1) * sw / dw);
+            uint32_t       sum[4] = {0, 0, 0, 0};
+            for (uint32_t y = y0; y < y1; y++)
+                for (uint32_t x = x0; x < x1; x++) {
+                    const uint8_t* s = src + y * stride + size_t(x) * 4;
+                    sum[0] += s[0];
+                    sum[1] += s[1];
+                    sum[2] += s[2];
+                    sum[3] += opaque ? 0xff : s[3];
+                }
+            const uint32_t n = (y1 - y0) * (x1 - x0);
+            uint8_t*       d = dst + (size_t(dy) * dw + dx) * 4;
+            for (int c = 0; c < 4; c++)
+                d[c] = (uint8_t)((sum[c] + n / 2) / n);
+        }
+    }
+}
+
+// Publish Hyprland's current cursor image at its logical size: Hyprland
+// renders cursors at the buffer scale (48 px for a 24 px theme) and draws
+// them scaled down, so the client must get the scaled-down image (the
+// hotspot is already logical). A cursor buffer we cannot read (not
+// CPU-mappable, unexpected format, oversized) keeps the last shape.
+static bool writeCursor(Target& t) {
+    if (!cursorShmSetup(t))
+        return false;
+    const auto& img = Pointer::mgr()->currentCursorImage();
+    auto*       hdr = reinterpret_cast<CursorHeader*>(t.curPtr);
+    auto*       px  = reinterpret_cast<uint8_t*>(t.curPtr) + sizeof(CursorHeader);
+
+    uint8_t* data   = nullptr;
+    uint32_t fmt    = 0;
+    size_t   stride = 0;
+    uint32_t w = 0, h = 0;
+    if (img.pBuffer) {
+        w = (uint32_t)img.pBuffer->size.x;
+        h = (uint32_t)img.pBuffer->size.y;
+        if (w == 0 || h == 0 || w > CURSOR_MAX || h > CURSOR_MAX)
+            return false;
+        std::tie(data, fmt, stride) = img.pBuffer->beginDataPtr(0);
+        if (!data || stride < size_t(w) * 4 ||
+            (fmt != DRM_FORMAT_ARGB8888 && fmt != DRM_FORMAT_XRGB8888)) {
+            if (data)
+                img.pBuffer->endDataPtr();
+            return false;
+        }
+    }
+
+    const float    scale = img.scale > 1.F ? img.scale : 1.F;
+    const uint32_t dw    = std::max<uint32_t>(1, (uint32_t)std::lround(w / scale));
+    const uint32_t dh    = std::max<uint32_t>(1, (uint32_t)std::lround(h / scale));
+
+    std::atomic_ref<uint64_t>(hdr->seq).store(t.curSeq + 1, std::memory_order_release);
+    if (data) {
+        downscaleCursor(data, stride, w, h, fmt == DRM_FORMAT_XRGB8888, px, dw, dh);
+        img.pBuffer->endDataPtr();
+    }
+    t.curSeq += 2;
+    hdr->magic     = CURSOR_MAGIC;
+    hdr->version   = 1;
+    hdr->width     = data ? dw : 0;
+    hdr->height    = data ? dh : 0;
+    hdr->srcWidth  = w;
+    hdr->srcHeight = h;
+    hdr->scale100  = (uint32_t)std::lround(img.scale * 100);
+    hdr->hotX    = (int32_t)img.hotspot.x;
+    hdr->hotY    = (int32_t)img.hotspot.y;
+    hdr->visible = data ? 1 : 0;
+    std::atomic_ref<uint64_t>(hdr->seq).store(t.curSeq, std::memory_order_release);
     return true;
 }
 
@@ -325,12 +515,194 @@ static void sockNotify(Target& t) {
 }
 
 // ---------------------------------------------------------------------------
+// Client-drawn cursor
+// ---------------------------------------------------------------------------
+
+// Hand every client-drawn target the new cursor image and wake its reader.
+static void onCursorChanged() {
+    for (auto& [name, t] : g_targets) {
+        if (t.clientCursor && writeCursor(t)) {
+            sockSetup();
+            sockNotify(t);
+        }
+    }
+}
+
+// Hyprland composites its software cursor into the output framebuffer before
+// RENDER_LAST_MOMENT, so the only way to keep it out of the captured frames is
+// to not draw it on that output. Two trampoline hooks on CPointerManager do
+// that for wayrdp outputs whose reader asked for it (HdrTail::cursorReq);
+// every other output and every screencopy render (screencopy = true, e.g.
+// cursor-session images) goes through untouched.
+static CFunctionHook* g_renderSwCursorsHook = nullptr;
+static CFunctionHook* g_damageCursorHook    = nullptr;
+
+static bool clientDrawsCursor(const PHLMONITOR& m) {
+    if (!isWayrdpMonitor(m))
+        return false;
+    auto it = g_targets.find(m->m_name);
+    if (it == g_targets.end() || !it->second.shmPtr)
+        return false;
+    return std::atomic_ref<uint32_t>(tailOf(it->second)->cursorReq)
+               .load(std::memory_order_acquire) == CURSOR_REQ_CLIENT;
+}
+
+typedef void (*RenderSwCursorsFn)(Pointer::CPointerManager*, PHLMONITOR, const Time::steady_tp&,
+                                  CRegion&, std::optional<Vector2D>, bool, bool);
+static void hkRenderSoftwareCursorsFor(Pointer::CPointerManager* self, PHLMONITOR m,
+                                       const Time::steady_tp& now, CRegion& damage,
+                                       std::optional<Vector2D> overridePos,
+                                       bool screencopy, bool forceRender) {
+    if (!screencopy && clientDrawsCursor(m))
+        return;
+    ((RenderSwCursorsFn)g_renderSwCursorsHook->m_original)(self, m, now, damage, overridePos,
+                                                            screencopy, forceRender);
+}
+
+// Cursor motion damages the cursor box and schedules a frame. With the
+// cursor not drawn there is nothing to repair, and skipping it keeps pointer
+// motion from producing (full-surface encoded) frames at all.
+typedef void (*DamageCursorFn)(Pointer::CPointerManager*, PHLMONITOR, bool);
+static void hkDamageCursor(Pointer::CPointerManager* self, PHLMONITOR m, bool skipFrameSchedule) {
+    if (clientDrawsCursor(m))
+        return;
+    ((DamageCursorFn)g_damageCursorHook->m_original)(self, m, skipFrameSchedule);
+}
+
+// Exactly one match whose demangled name is Pointer::CPointerManager::<name>(...), so
+// an overload or a same-named method elsewhere can never be hooked.
+static CFunctionHook* hookPointerManager(const std::string& name, const void* dest) {
+    void* addr = nullptr;
+    for (const auto& f : HyprlandAPI::findFunctionsByName(g_pHandle, name)) {
+        if (!f.demangled.starts_with("Pointer::CPointerManager::" + name + "("))
+            continue;
+        if (addr) {
+            Log::logger->log(Log::ERR, "[wayrdp-capture] {} is ambiguous; not hooking", name);
+            return nullptr;
+        }
+        addr = f.address;
+    }
+    if (!addr) {
+        Log::logger->log(Log::ERR, "[wayrdp-capture] CPointerManager::{} not found", name);
+        return nullptr;
+    }
+    auto* hook = HyprlandAPI::createFunctionHook(g_pHandle, addr, dest);
+    if (hook && hook->hook())
+        return hook;
+    if (hook)
+        HyprlandAPI::removeFunctionHook(g_pHandle, hook);
+    Log::logger->log(Log::ERR, "[wayrdp-capture] hooking CPointerManager::{} failed", name);
+    return nullptr;
+}
+
+static void removeCursorHooks() {
+    for (auto** h : {&g_renderSwCursorsHook, &g_damageCursorHook}) {
+        if (*h)
+            HyprlandAPI::removeFunctionHook(g_pHandle, *h);
+        *h = nullptr;
+    }
+    g_cursorHooked = false;
+}
+
+// Both hooks or neither: a hidden cursor that still damages (or the reverse)
+// is worse than the painted one. Without them caps stays 0 and readers keep
+// the painted cursor.
+static void installCursorHooks() {
+    g_renderSwCursorsHook = hookPointerManager("renderSoftwareCursorsFor",
+                                               (void*)&hkRenderSoftwareCursorsFor);
+    g_damageCursorHook    = hookPointerManager("damageCursor", (void*)&hkDamageCursor);
+    g_cursorHooked        = g_renderSwCursorsHook && g_damageCursorHook;
+    if (!g_cursorHooked)
+        removeCursorHooks();
+}
+
+// ---------------------------------------------------------------------------
 // Hooks
 // ---------------------------------------------------------------------------
 
+// A capture armed at RENDER_LAST_MOMENT, read after endRender (see e9 below).
+struct PendingCapture {
+    bool          armed = false;
+    PHLMONITORREF mon;
+    GLint         fb = -1; // out FB of the armed frame; -1 = the bound READ FB
+    FrameRect     rects[MAX_DAMAGE_RECTS] = {};
+    uint32_t      nrects = 0;
+};
+static PendingCapture g_pending;
+static CFunctionHook* g_endRenderHook = nullptr;
+
 static void onRenderPre(PHLMONITOR m) {
+    g_pending.armed = false; // a render that never reached endRender
     g_currentMon  = m;
     g_inWayrdpMon = isWayrdpMonitor(m);
+    if (!g_inWayrdpMon)
+        return;
+    auto it = g_targets.find(m->m_name);
+    if (it == g_targets.end())
+        return;
+    const bool client = clientDrawsCursor(m);
+    if (client != it->second.clientCursor) {
+        // The cursor just left (or rejoined) the frames: repaint the whole
+        // output once so its last painted image does not linger.
+        it->second.clientCursor = client;
+        g_pHyprRenderer->damageMonitor(m);
+        if (client)
+            onCursorChanged();
+        Log::logger->log(Log::INFO, "[wayrdp-capture] {}: cursor {}", m->m_name,
+                         client ? "drawn by the client" : "painted");
+    }
+}
+
+// e9: read the frame AFTER Hyprland has drawn it. Hyprland 0.56 records the
+// frame's elements into a CRenderPass and only executes it inside
+// endRender(), so at RENDER_LAST_MOMENT the render target is still empty and
+// the swapchain buffer bound for reading holds the frame from one swapchain
+// cycle ago (3 renders: measured on O6 as ~52 ms of commit→capture lag). So
+// RENDER_LAST_MOMENT only arms a capture — this frame's damage and its out
+// FB — and a hook on CHyprGLRenderer::endRender reads that FB once the pass
+// has run and been copied out (the GL context is still current there).
+// Without the hook the readback stays at RENDER_LAST_MOMENT (one cycle late).
+// (PendingCapture / g_pending above.)
+
+static GLint glFbId(const SP<Render::IFramebuffer>& fb) {
+    auto* gl = dynamic_cast<Render::GL::CGLFramebuffer*>(fb.get());
+    return gl ? (GLint)gl->getFBID() : -1;
+}
+
+static void captureFrame(const PHLMONITOR& mon, GLint readFb, const FrameRect* frameRects,
+                         uint32_t frameRectCount);
+
+// e2a: this frame's compositor damage. NOT from m_damage directly —
+// beginRender() (getBufferDamage + rotate) ran before RENDER_LAST_MOMENT
+// fires, so m_damage.m_current is already cleared here. The frame's
+// damage lives in the renderer's m_renderData.damage: it IS the value
+// beginRender pulled, clipped to monitor bounds by the damage ring —
+// except it is NOT capped at 8 rects (Hyprland caps getBufferDamage
+// output, but extra damage added to renderData.damage during the pass
+// bypasses that), so we cap ourselves: >8 collapses to full-surface,
+// partial damage being worse than full. Coords are buffer-space
+// (top-left origin, scale included) — matching glReadPixels rows.
+// Empty damage is NOT "no change" (blur paths damage the pass but not
+// the ring; the monitor only renders when something changed), so a
+// zero-rect read publishes full-surface instead.
+// nrects == 0 (empty region, all-degenerate, monitor mismatch, or the
+// >8 collapse) → header publishes full-surface.
+static uint32_t collectDamage(FrameRect (&rects)[MAX_DAMAGE_RECTS]) {
+    uint32_t nrects = 0;
+    if (g_pHyprRenderer->m_renderData.pMonitor == g_currentMon) {
+        const auto& dmg = g_pHyprRenderer->m_renderData.damage;
+        auto        boxes = dmg.getRects();
+        if (boxes.size() <= MAX_DAMAGE_RECTS) {
+            for (const auto& b : boxes) {
+                if (b.x2 <= b.x1 || b.y2 <= b.y1)
+                    continue;
+                rects[nrects++] = FrameRect{(uint32_t)b.x1, (uint32_t)b.y1,
+                                            (uint32_t)(b.x2 - b.x1),
+                                            (uint32_t)(b.y2 - b.y1)};
+            }
+        }
+    }
+    return nrects;
 }
 
 static void onRenderStage(eRenderStage stage) {
@@ -339,18 +711,69 @@ static void onRenderStage(eRenderStage stage) {
     if (stage != RENDER_LAST_MOMENT)
         return;
 
-    const auto w = (uint32_t)g_currentMon->m_size.x;
-    const auto h = (uint32_t)g_currentMon->m_size.y;
+    g_pending        = {};
+    g_pending.nrects = collectDamage(g_pending.rects);
+    if (g_endRenderHook) {
+        g_pending.armed = true;
+        g_pending.mon   = g_currentMon;
+        g_pending.fb    = glFbId(g_pHyprRenderer->m_renderData.outFB);
+        return;
+    }
+    captureFrame(g_currentMon, -1, g_pending.rects, g_pending.nrects);
+}
+
+typedef void (*EndRenderFn)(void*, const std::function<void()>&);
+static void hkEndRender(void* self, const std::function<void()>& renderingDone) {
+    // Only the endRender of the armed monitor's own render: any other
+    // (screencopy, snapshot, another output) leaves the pending capture alone.
+    const bool ours = g_pending.armed && g_pending.mon &&
+                      g_pHyprRenderer->m_renderData.pMonitor == g_pending.mon;
+    ((EndRenderFn)g_endRenderHook->m_original)(self, renderingDone);
+    if (!ours)
+        return;
+    g_pending.armed = false;
+    if (auto mon = g_pending.mon.lock())
+        captureFrame(mon, g_pending.fb, g_pending.rects, g_pending.nrects);
+}
+
+static void installEndRenderHook() {
+    void* addr = nullptr;
+    for (const auto& f : HyprlandAPI::findFunctionsByName(g_pHandle, "endRender")) {
+        if (!f.demangled.starts_with("Render::GL::CHyprGLRenderer::endRender("))
+            continue;
+        if (addr) {
+            Log::logger->log(Log::ERR, "[wayrdp-capture] endRender is ambiguous; not hooking");
+            return;
+        }
+        addr = f.address;
+    }
+    if (!addr) {
+        Log::logger->log(Log::ERR, "[wayrdp-capture] CHyprGLRenderer::endRender not found");
+        return;
+    }
+    auto* hook = HyprlandAPI::createFunctionHook(g_pHandle, addr, (void*)&hkEndRender);
+    if (hook && hook->hook()) {
+        g_endRenderHook = hook;
+        return;
+    }
+    if (hook)
+        HyprlandAPI::removeFunctionHook(g_pHandle, hook);
+    Log::logger->log(Log::ERR, "[wayrdp-capture] hooking CHyprGLRenderer::endRender failed");
+}
+
+static void captureFrame(const PHLMONITOR& mon, GLint readFb, const FrameRect* frameRects,
+                         uint32_t frameRectCount) {
+    const auto w = (uint32_t)mon->m_size.x;
+    const auto h = (uint32_t)mon->m_size.y;
     if (w == 0 || h == 0)
         return;
 
-    auto [it, fresh] = g_targets.try_emplace(g_currentMon->m_name,
-                                             g_currentMon->m_name);
+    auto [it, fresh] = g_targets.try_emplace(mon->m_name, mon->m_name);
     Target& t = it->second;
     if (fresh)
         Log::logger->log(Log::INFO,
                          "[wayrdp-capture] new target for monitor {}",
-                         g_currentMon->m_name);
+                         mon->m_name);
 
     if (!shmSetup(t, w, h)) {
         // Log throttled, do not kill the renderer with repeated setup costs.
@@ -387,7 +810,7 @@ static void onRenderStage(eRenderStage stage) {
                 Log::WARN,
                 "[wayrdp-capture] bank busy on {}: reader still holds seq {}; "
                 "frame dropped (total {})",
-                g_currentMon->m_name, t.publishedSeq[bank], t.dropSlotBusy);
+                mon->m_name, t.publishedSeq[bank], t.dropSlotBusy);
         return; // writeSlot NOT toggled: retry this bank next frame
     }
     t.writeSlot ^= 1; // publish happens → next frame lands in the other bank
@@ -403,44 +826,20 @@ static void onRenderStage(eRenderStage stage) {
     // already written and treat the frame as stable mid-write. Costs ~0.
     std::atomic_ref<uint64_t>(hdr->seq).store(t.seq + 1, std::memory_order_release);
 
-    // Read the bound output FBO. At RENDER_LAST_MOMENT Hyprland has just
-    // finished rendering this monitor and the GL context is still active.
+    // Read the frame's out FB (readFb, from the endRender hook) or, on the
+    // fallback path, whatever is bound for reading at RENDER_LAST_MOMENT.
     GLubyte* pixels = reinterpret_cast<GLubyte*>(t.shmPtr) + HEADER_SIZE +
                       (size_t)bank * t.frameW * t.frameH * 4;
+    GLint prevReadFb = 0;
+    if (readFb >= 0) {
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFb);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)readFb);
+    }
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(0, 0, (GLsizei)t.frameW, (GLsizei)t.frameH,
                  GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels);
-
-    // e2a: this frame's compositor damage. NOT from m_damage directly —
-    // beginRender() (getBufferDamage + rotate) ran before RENDER_LAST_MOMENT
-    // fires, so m_damage.m_current is already cleared here. The frame's
-    // damage lives in the renderer's m_renderData.damage: it IS the value
-    // beginRender pulled, clipped to monitor bounds by the damage ring —
-    // except it is NOT capped at 8 rects (Hyprland caps getBufferDamage
-    // output, but extra damage added to renderData.damage during the pass
-    // bypasses that), so we cap ourselves: >8 collapses to full-surface,
-    // partial damage being worse than full. Coords are buffer-space
-    // (top-left origin, scale included) — matching glReadPixels rows.
-    // Empty damage is NOT "no change" (blur paths damage the pass but not
-    // the ring; the monitor only renders when something changed), so a
-    // zero-rect read publishes full-surface instead.
-    FrameRect rects[MAX_DAMAGE_RECTS] = {};
-    uint32_t  nrects = 0;
-    if (g_pHyprRenderer->m_renderData.pMonitor == g_currentMon) {
-        const auto& dmg = g_pHyprRenderer->m_renderData.damage;
-        auto        boxes = dmg.getRects();
-        if (boxes.size() <= MAX_DAMAGE_RECTS) {
-            for (const auto& b : boxes) {
-                if (b.x2 <= b.x1 || b.y2 <= b.y1)
-                    continue;
-                rects[nrects++] = FrameRect{(uint32_t)b.x1, (uint32_t)b.y1,
-                                            (uint32_t)(b.x2 - b.x1),
-                                            (uint32_t)(b.y2 - b.y1)};
-            }
-        }
-    }
-    // nrects == 0 (empty region, all-degenerate, monitor mismatch, or the
-    // >8 collapse above) → header publishes full-surface.
+    if (readFb >= 0)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevReadFb);
 
     // Publish AFTER the pixel write completes. The pad stamp, damage rects
     // and the active-bank selector go in the same critical section so the
@@ -451,9 +850,10 @@ static void onRenderStage(eRenderStage stage) {
     hdr->height      = t.frameH;
     hdr->pad         = (uint32_t)nowMonoMs();
     hdr->version     = HDR_VERSION;
-    hdr->rect_count  = nrects;
-    std::memcpy(hdr->rects, rects, sizeof(rects));
+    hdr->rect_count  = frameRectCount;
+    std::memcpy(hdr->rects, frameRects, sizeof(hdr->rects));
     tail->active     = bank;
+    tail->caps       = g_cursorHooked ? CAP_CLIENT_CURSOR : 0;
     t.publishedSeq[bank] = t.seq;
     std::atomic_ref<uint64_t>(hdr->seq).store(t.seq, std::memory_order_release);
 
@@ -464,7 +864,7 @@ static void onRenderStage(eRenderStage stage) {
         Log::logger->log(Log::INFO,
                          "[wayrdp-capture] frame #{} {}x{} on {} (drops={}, bank-busy={})",
                          t.seq, t.frameW, t.frameH,
-                         g_currentMon->m_name, t.dropNoPeer, t.dropSlotBusy);
+                         mon->m_name, t.dropNoPeer, t.dropSlotBusy);
     }
 }
 
@@ -502,7 +902,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO pluginInit(HANDLE handle) {
     g_onMonitorDestroy = bus->m_events.monitor.destroyMon.listen(
         [](PHLMONITOR m) { onMonitorDestroy(m); });
 
-    Log::logger->log(Log::INFO, "[wayrdp-capture] loaded, targeting prefix={}", g_targetPrefix);
+    installEndRenderHook();
+    installCursorHooks();
+    if (g_cursorHooked)
+        g_onCursorChanged = Pointer::mgr()->m_events.cursorChanged.listen([] { onCursorChanged(); });
+
+    Log::logger->log(Log::INFO, "[wayrdp-capture] loaded, targeting prefix={}, client cursor {}, readback {}",
+                     g_targetPrefix, g_cursorHooked ? "supported" : "unsupported",
+                     g_endRenderHook ? "after endRender" : "at RENDER_LAST_MOMENT (one swapchain cycle late)");
 
     return {"wayrdp-capture",
             "Direct-render capture for wayrdp (skips ext-image-copy paint)",
@@ -517,6 +924,12 @@ APICALL EXPORT void pluginExit() {
     g_onRenderStage      = {};
     g_onRenderPre        = {};
     g_onMonitorDestroy   = {};
+    g_onCursorChanged    = {};
+    removeCursorHooks();
+    if (g_endRenderHook)
+        HyprlandAPI::removeFunctionHook(g_pHandle, g_endRenderHook);
+    g_endRenderHook = nullptr;
+    g_pending       = {};
 
     if (g_sockFd >= 0) {
         close(g_sockFd);
@@ -524,6 +937,7 @@ APICALL EXPORT void pluginExit() {
     }
     for (auto& [name, t] : g_targets) {
         shmTeardown(t);
+        cursorShmTeardown(t);
     }
     g_targets.clear();
 }

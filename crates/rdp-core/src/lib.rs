@@ -6,6 +6,7 @@
 //! so protocol code never knows the desktop is fake.
 
 pub mod synthetic;
+pub mod trace;
 
 #[cfg(unix)]
 pub mod clipformat;

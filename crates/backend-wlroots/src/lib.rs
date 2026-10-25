@@ -32,6 +32,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+use desk_backend::stats::LatStats;
 use desk_backend::{
     BackendError, CaptureSession, CaptureTarget, DesktopBackend, Frame, FrameMeta, FramePixels,
     FrameTx, InputEvent, PixelFormat, PointerButton, Rect, Result, SessionRequest, Size,
@@ -333,44 +334,44 @@ fn now_mono_ms_u32() -> u32 {
     (ms & 0xffff_ffff) as u32
 }
 
-/// Rolling latency stats for WAYRDP_DEBUG_CAPTURE logging: windowed
-/// count/avg/p95/max over u32-millisecond samples. `take_summary` resets the
-/// window, so each log line covers the interval since the previous one.
-#[derive(Default)]
-struct LatStats {
-    n: u64,
-    sum: u64,
-    max: u32,
-    samples: Vec<u32>,
+/// WAYRDP_TRACE_MARKER=`dx,dy,rrggbb`: a test page draws a marker of that
+/// colour at pointer + (dx, dy) (the T4 probe: `60,0,ff00ff`). The shm pump
+/// then times each injected motion until a captured frame shows the marker
+/// there — input → visible change, compositor and app included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TraceMarker {
+    dx: i32,
+    dy: i32,
+    rgb: [u8; 3],
 }
 
-impl LatStats {
-    fn push(&mut self, ms: u32) {
-        self.n += 1;
-        self.sum += ms as u64;
-        self.max = self.max.max(ms);
-        if self.samples.len() < 4096 {
-            self.samples.push(ms);
-        }
+fn parse_trace_marker(v: &str) -> Option<TraceMarker> {
+    let mut it = v.split(',');
+    let dx = it.next()?.trim().parse().ok()?;
+    let dy = it.next()?.trim().parse().ok()?;
+    let hex = it.next()?.trim();
+    if it.next().is_some() || hex.len() != 6 {
+        return None;
     }
+    let c = u32::from_str_radix(hex, 16).ok()?;
+    Some(TraceMarker {
+        dx,
+        dy,
+        rgb: [(c >> 16) as u8, (c >> 8) as u8, c as u8],
+    })
+}
 
-    /// Returns (n, avg_ms, p95_ms, max_ms) and clears the window.
-    fn take_summary(&mut self) -> (u64, u32, u32, u32) {
-        let n = self.n;
-        let avg = if n > 0 { (self.sum / n) as u32 } else { 0 };
-        let p95 = if self.samples.is_empty() {
-            0
-        } else {
-            let mut v = std::mem::take(&mut self.samples);
-            v.sort_unstable();
-            v[(v.len() * 95 / 100).min(v.len() - 1)]
-        };
-        let max = self.max;
-        self.n = 0;
-        self.sum = 0;
-        self.max = 0;
-        (n, avg, p95, max)
+/// Whether the BGRA pixel at (x, y) is the marker colour (±8 per channel).
+fn marker_at(pixels: &[u8], stride: usize, size: Size, x: i32, y: i32, rgb: [u8; 3]) -> bool {
+    if x < 0 || y < 0 || x as u32 >= size.width || y as u32 >= size.height {
+        return false;
     }
+    let off = y as usize * stride + x as usize * 4;
+    let Some(px) = pixels.get(off..off + 3) else {
+        return false;
+    };
+    let near = |a: u8, b: u8| a.abs_diff(b) <= 8;
+    near(px[0], rgb[2]) && near(px[1], rgb[1]) && near(px[2], rgb[0])
 }
 
 pub struct WlrCaptureSession {
@@ -547,14 +548,13 @@ impl CaptureSession for WlrCaptureSession {
         *self.frame_wake.lock().unwrap_or_else(|p| p.into_inner()) = Some(wake);
     }
 
-    /// Client-drawn cursor: the ext-image-copy pump captures the cursor
-    /// through a pointer cursor session and stops painting it into frames.
-    /// The shm-plugin capture path has no cursor session, so it declines and
-    /// keeps the painted cursor.
+    /// Client-drawn cursor: the pump stops painting the cursor into frames
+    /// and publishes its image to the slot — the ext-image-copy pump through
+    /// a pointer cursor session, the shm-plugin pump by asking the capture
+    /// plugin to leave Hyprland's cursor out and reading the image the
+    /// plugin publishes. A plugin without that support keeps the cursor
+    /// painted and the slot empty (the client keeps its transparent pointer).
     fn set_pointer_shape_slot(&mut self, slot: desk_backend::PointerShapeSlot) -> bool {
-        if std::env::var("WAYRDP_CAPTURE").is_ok_and(|v| v == "shm-plugin") {
-            return false;
-        }
         *self.cursor_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(slot);
         true
     }
@@ -2210,6 +2210,115 @@ fn settle_after_create(name: &str) {
 /// e8/v2: reader-written "released up to seq" words, banks 0/1 at
 /// 168/176 (8-aligned; 160-167 hold active+pad, written by the plugin).
 const REL0_OFFSET: usize = 168;
+/// Client-drawn cursor handshake in the v2 header tail: the plugin stamps
+/// its capability bits at 184 with every frame; the reader asks it to leave
+/// Hyprland's software cursor out of this output's frames by writing
+/// CURSOR_REQ_CLIENT at 188 (anything else = painted).
+const CAPS_OFFSET: usize = 184;
+const CURSOR_REQ_OFFSET: usize = 188;
+const CAP_CLIENT_CURSOR: u32 = 1;
+const CURSOR_REQ_CLIENT: u32 = 0x5253_4355; // "UCSR"
+
+/// The plugin that wrote this header leaves the cursor out on request and
+/// publishes its image. Only a v2 header has the caps word; an older plugin
+/// leaves it zero.
+fn plugin_supports_client_cursor(hdr_size: usize, header: &[u8]) -> bool {
+    hdr_size == ShmCapture::HDR_SIZE_V2
+        && header
+            .get(CAPS_OFFSET..CAPS_OFFSET + 4)
+            .is_some_and(|w| u32::from_ne_bytes(w.try_into().unwrap()) & CAP_CLIENT_CURSOR != 0)
+}
+
+/// Cursor image the capture plugin publishes for a client-drawn cursor
+/// (`/dev/shm/wayrdp-cursor-<output>`, see CursorHeader in
+/// plugins/hyprland-capture/main.cpp): magic u32, version u32, seq u64
+/// (seqlock), width u32, height u32, hot_x i32, hot_y i32, visible u32,
+/// then ARGB8888 rows from byte 64.
+struct PluginCursor {
+    mmap: memmap2::Mmap,
+    last_seq: u64,
+}
+
+impl PluginCursor {
+    const MAGIC: u32 = 0x5743_5552;
+    const HDR: usize = 64;
+    const MAX: u32 = 256;
+
+    fn path_for(output_name: &str) -> std::path::PathBuf {
+        format!("/dev/shm/wayrdp-cursor-{output_name}").into()
+    }
+
+    fn open(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let f = std::fs::File::open(path).ok()?;
+        let md = f.metadata().ok()?;
+        if md.uid() != unsafe { libc::getuid() } {
+            eprintln!(
+                "[backend-wlroots] refusing cursor shm {path:?}: uid {} != ours",
+                md.uid()
+            );
+            return None;
+        }
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&f).ok()? };
+        (mmap.len() >= Self::HDR).then_some(Self { mmap, last_seq: 0 })
+    }
+
+    /// The cursor state published since the last call, if any.
+    fn poll(&mut self) -> Option<desk_backend::CursorUpdate> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let read_seq = |m: &memmap2::Mmap| {
+            // u64 at offset 8 of a page-aligned map: aligned, read atomically.
+            let ptr = m[8..].as_ptr() as *const AtomicU64;
+            unsafe { (*ptr).load(Ordering::Acquire) }
+        };
+        for _ in 0..3 {
+            let before = read_seq(&self.mmap);
+            if before == self.last_seq {
+                return None;
+            }
+            if before & 1 == 0 {
+                let update = parse_plugin_cursor(&self.mmap);
+                if read_seq(&self.mmap) == before {
+                    self.last_seq = before;
+                    return update;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        None
+    }
+}
+
+/// Decode a stable cursor shm snapshot. None = nothing usable (not written
+/// yet, foreign layout, or out-of-bounds geometry).
+fn parse_plugin_cursor(buf: &[u8]) -> Option<desk_backend::CursorUpdate> {
+    let word = |o: usize| {
+        buf.get(o..o + 4)
+            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+    };
+    if word(0)? != PluginCursor::MAGIC || word(4)? != 1 {
+        return None;
+    }
+    if word(32)? == 0 {
+        return Some(desk_backend::CursorUpdate::Hidden);
+    }
+    let (w, h) = (word(16)?, word(20)?);
+    if w == 0 || h == 0 || w > PluginCursor::MAX || h > PluginCursor::MAX {
+        return None;
+    }
+    let px = buf.get(PluginCursor::HDR..PluginCursor::HDR + (w * h * 4) as usize)?;
+    let hotspot = (word(24)? as i32, word(28)? as i32);
+    let img = cursor_image_from_shm(
+        px,
+        Size {
+            width: w,
+            height: h,
+        },
+        wl_shm::Format::Argb8888,
+        hotspot,
+    );
+    Some(desk_backend::CursorUpdate::Shape(Arc::new(img)))
+}
 struct ShmFile {
     mmap: memmap2::Mmap,
     dev: u64,
@@ -2238,6 +2347,21 @@ impl ShmFile {
                     (REL0_OFFSET + slot * 8) as libc::off_t,
                 );
             }
+        }
+    }
+
+    /// Ask the plugin to leave the cursor out of this output's frames (the
+    /// client draws it) or to paint it again.
+    fn request_client_cursor(&self, on: bool) {
+        use std::os::unix::io::AsRawFd;
+        let word = if on { CURSOR_REQ_CLIENT } else { 0 }.to_ne_bytes();
+        unsafe {
+            libc::pwrite(
+                self.file.as_raw_fd(),
+                word.as_ptr() as *const libc::c_void,
+                4,
+                CURSOR_REQ_OFFSET as libc::off_t,
+            );
         }
     }
 }
@@ -2383,6 +2507,10 @@ impl ShmCapture {
             double_buffered,
             file,
         })
+    }
+
+    fn supports_client_cursor(&self) -> bool {
+        plugin_supports_client_cursor(self.hdr_size, &self.file.mmap)
     }
 
     /// Read the v1 damage-rect extension from the (stable) header, with
@@ -3323,11 +3451,37 @@ fn pump_loop_shm(
     // drain (input queue wait). Sampled every frame/event, logged ~5s.
     let mut lat_pub = LatStats::default();
     let mut lat_in = LatStats::default();
+    // Input → next published frame: the compositor's response (render +
+    // plugin readback). Armed when an input batch is flushed, consumed by
+    // the first frame the plugin stamped after it. Pointer motion that
+    // repaints nothing (client-drawn cursor) never produces a frame, so an
+    // armed stamp expires after RESPONSE_WINDOW_MS rather than pairing with
+    // some unrelated later frame.
+    const RESPONSE_WINDOW_MS: u32 = 250;
+    let mut lat_resp = LatStats::default();
+    let mut input_flushed_at: Option<u32> = None;
+    let trace_on = std::env::var_os("WAYRDP_DEBUG_CAPTURE").is_some()
+        || std::env::var_os("WAYRDP_TRACE").is_some();
+    let marker = std::env::var("WAYRDP_TRACE_MARKER")
+        .ok()
+        .and_then(|v| parse_trace_marker(&v))
+        .filter(|_| trace_on);
+    // (target x, target y, injected at): the newest motion supersedes, so a
+    // sample is "this position's marker became visible".
+    let mut marker_armed: Option<(i32, i32, u32)> = None;
+    let mut lat_marker = LatStats::default();
+    const MARKER_WINDOW_MS: u32 = 1000;
     let mut win_frames: u64 = 0;
     // e2a stats: how much of the surface do compositor damage rects cover?
     // Feeds the e3 two-tier (planar/RFX) threshold decision.
     let mut win_dmg_pct_sum: f64 = 0.0;
     let mut win_dmg_granular: u64 = 0;
+    // Client-drawn cursor: asked of the plugin through the frame shm, image
+    // read from the plugin's cursor shm.
+    let mut cursor_requested = false;
+    let mut cursor_unsupported_logged = false;
+    let mut plugin_cursor: Option<PluginCursor> = None;
+    let mut cursor_open_at = std::time::Instant::now();
 
     macro_rules! inject_ev {
         ($ev:expr) => {{
@@ -3380,12 +3534,35 @@ fn pump_loop_shm(
         }
         if let Some((x, y)) = coalesced_motion {
             inject_ev!(InputEvent::PointerMotion { x, y });
+            if let Some(m) = marker {
+                marker_armed = Some((x + m.dx, y + m.dy, now_mono_ms_u32()));
+            }
         }
         // Input flush now — don't wait for the end-of-iteration `flush()`.
         // Every ms of delay between "mouse moved" and "compositor saw it"
         // is felt as lag.
         if got_input {
             let _ = event_queue.flush();
+            if trace_on {
+                input_flushed_at = Some(now_mono_ms_u32());
+            }
+        }
+
+        // Client-drawn cursor: a changed image goes to the client right away
+        // (the peer mainloop is woken; no frame needed). The plugin creates
+        // its cursor shm when it sees the request, so keep trying to open it.
+        if cursor_requested {
+            if plugin_cursor.is_none() && cursor_open_at.elapsed().as_millis() >= 100 {
+                cursor_open_at = std::time::Instant::now();
+                plugin_cursor = PluginCursor::open(&PluginCursor::path_for(&state.output_name));
+            }
+            if let Some(update) = plugin_cursor.as_mut().and_then(|c| c.poll()) {
+                if state.cursor.publish(update) {
+                    if let Some(wake) = &frame_wake {
+                        wake();
+                    }
+                }
+            }
         }
 
         // Disconnect/watchdog.
@@ -3411,6 +3588,24 @@ fn pump_loop_shm(
                         "[backend-wlroots] shm opened for {}: {}x{}",
                         state.output_name, s.width, s.height
                     );
+                    // Client-drawn cursor needs a plugin that leaves the
+                    // cursor out and publishes its image. Asked on every
+                    // open: a recreated frame file starts painted.
+                    if state.cursor.slot.is_some() {
+                        if s.supports_client_cursor() {
+                            s.file.request_client_cursor(true);
+                            if !cursor_requested {
+                                eprintln!(
+                                    "[backend-wlroots] client cursor on {}: plugin leaves it out of the frames",
+                                    state.output_name
+                                );
+                            }
+                            cursor_requested = true;
+                        } else if !cursor_unsupported_logged {
+                            eprintln!("[backend-wlroots] client cursor: capture plugin cannot hide the cursor (rebuild it); cursor stays painted");
+                            cursor_unsupported_logged = true;
+                        }
+                    }
                     shm = Some(s);
                 }
                 None => {
@@ -3435,8 +3630,41 @@ fn pump_loop_shm(
             // e12: publish→drain queue wait from the plugin's capture stamp
             // (same CLOCK_MONOTONIC domain; 0 = old unstamped plugin).
             let stamp = frame.meta.capture_stamp_ms;
+            if let (Some(m), Some((x, y, t))) = (marker, marker_armed) {
+                let at = if stamp != 0 { stamp } else { now_mono_ms_u32() };
+                if marker_at(
+                    &frame.pixels[..],
+                    frame.meta.stride,
+                    frame.meta.size,
+                    x,
+                    y,
+                    m.rgb,
+                ) {
+                    lat_marker.push(at.wrapping_sub(t));
+                    marker_armed = None;
+                    // Per-sample record, joined offline with the test
+                    // client's own receive/commit stamps on (x, y).
+                    eprintln!(
+                        "[trace-marker] x={} y={} inject={t} visible={at}",
+                        x - m.dx,
+                        y - m.dy
+                    );
+                } else if now_mono_ms_u32().wrapping_sub(t) >= MARKER_WINDOW_MS {
+                    marker_armed = None;
+                }
+            }
             if stamp != 0 {
                 lat_pub.push(now_mono_ms_u32().wrapping_sub(stamp));
+                if let Some(t) = input_flushed_at {
+                    let d = stamp.wrapping_sub(t);
+                    // d >= 2^31: published before the flush (pre-input frame).
+                    if d < RESPONSE_WINDOW_MS {
+                        lat_resp.push(d);
+                        input_flushed_at = None;
+                    } else if d < 1 << 31 {
+                        input_flushed_at = None;
+                    }
+                }
             }
             // e2a: accumulate damage coverage for the stats window. A frame
             // counts as "granular" when it did NOT fall back to the single
@@ -3471,24 +3699,28 @@ fn pump_loop_shm(
             // Every 5s (and only under WAYRDP_DEBUG_CAPTURE), dump the
             // latency window: pub = plugin-publish→pump-drain, in = peer
             // decode→pump-drain. Values are avg/p95/max ms over the window.
-            if last_hist.elapsed().as_secs() >= 5
-                && std::env::var_os("WAYRDP_DEBUG_CAPTURE").is_some()
-            {
-                let (pf, pa, p95, pm) = lat_pub.take_summary();
-                let (nf, ia, i95, im) = lat_in.take_summary();
+            if last_hist.elapsed().as_secs() >= 5 && trace_on {
+                let lp = lat_pub.take_summary();
+                let li = lat_in.take_summary();
+                let lr = lat_resp.take_summary();
+                let lm = lat_marker.take_summary();
                 eprintln!(
-                    "[pump-shm] frames={} cap={}ms fps_win={:.1} pub_ms(avg/p95/max)={}/{}/{} over {} in_ms(avg/p95/max)={}/{}/{} over {} dmg_pct={:.1} dmg_gran={}/{}",
+                    "[pump-shm] frames={} cap={}ms fps_win={:.1} pub_ms(avg/p95/max)={}/{}/{} over {} in_ms(avg/p95/max)={}/{}/{} over {} in→pub(p50/p95/max)={} over {} in→marker(p50/p95/max)={} over {} dmg_pct={:.1} dmg_gran={}/{}",
                     frames_sent,
                     cap_ms,
                     win_frames as f64 / last_hist.elapsed().as_secs_f64(),
-                    pa,
-                    p95,
-                    pm,
-                    pf,
-                    ia,
-                    i95,
-                    im,
-                    nf,
+                    lp.avg,
+                    lp.p95,
+                    lp.max,
+                    lp.n,
+                    li.avg,
+                    li.p95,
+                    li.max,
+                    li.n,
+                    lr,
+                    lr.n,
+                    lm,
+                    lm.n,
                     win_dmg_pct_sum / win_frames.max(1) as f64,
                     win_dmg_granular,
                     win_frames,
@@ -3499,6 +3731,11 @@ fn pump_loop_shm(
                 last_hist = std::time::Instant::now();
             }
         } else {
+            if let Some(t) = input_flushed_at {
+                if now_mono_ms_u32().wrapping_sub(t) >= RESPONSE_WINDOW_MS {
+                    input_flushed_at = None;
+                }
+            }
             // No new frame: verify the shm isn't stale. On a resize the
             // plugin unlinks the old file and creates a new one; if we
             // mapped it in between, seq never advances again and the session
@@ -3590,6 +3827,11 @@ fn pump_loop_shm(
         p.destroy();
     }
     drop(state.vkbd.take());
+    if cursor_requested {
+        if let Some(s) = &shm {
+            s.file.request_client_cursor(false);
+        }
+    }
     let _ = event_queue.flush();
     destroy_headless_output(&state.output_name);
     eprintln!(
@@ -3605,7 +3847,133 @@ fn pump_loop_shm(
 #[cfg(test)]
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trace_marker_parses_offset_and_colour() {
+        assert_eq!(
+            super::parse_trace_marker("60,0,ff00ff"),
+            Some(super::TraceMarker {
+                dx: 60,
+                dy: 0,
+                rgb: [0xff, 0, 0xff]
+            })
+        );
+        assert_eq!(
+            super::parse_trace_marker(" -4 , 7 , 00FF10 ").map(|m| (m.dx, m.dy, m.rgb)),
+            Some((-4, 7, [0, 0xff, 0x10]))
+        );
+        for bad in ["", "60,0", "60,0,ff00f", "60,0,ff00ff,1", "x,0,ff00ff", "60,0,gg00ff"] {
+            assert_eq!(super::parse_trace_marker(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn marker_matches_bgra_with_tolerance_and_bounds() {
+        let size = desk_backend::Size { width: 2, height: 2 };
+        // stride 12: 2 px + 4 bytes row padding
+        let mut px = vec![0u8; 24];
+        // (1,1) = magenta, slightly off, in BGRA
+        px[12 + 4..12 + 8].copy_from_slice(&[250, 5, 251, 255]);
+        let magenta = [0xff, 0x00, 0xff];
+        assert!(super::marker_at(&px, 12, size, 1, 1, magenta));
+        assert!(!super::marker_at(&px, 12, size, 0, 1, magenta));
+        assert!(!super::marker_at(&px, 12, size, 2, 1, magenta));
+        assert!(!super::marker_at(&px, 12, size, -1, 0, magenta));
+        assert!(!super::marker_at(&px[..14], 12, size, 1, 1, magenta));
+        assert!(!super::marker_at(&px, 12, size, 1, 1, [0xff, 0x00, 0xe0]));
+    }
+
     use super::lcid_to_xkb;
+
+    fn v2_header(caps: u32) -> Vec<u8> {
+        let mut h = vec![0u8; super::ShmCapture::HDR_SIZE_V2];
+        h[super::CAPS_OFFSET..super::CAPS_OFFSET + 4].copy_from_slice(&caps.to_ne_bytes());
+        h
+    }
+
+    #[test]
+    fn client_cursor_needs_the_plugin_capability() {
+        let v2 = super::ShmCapture::HDR_SIZE_V2;
+        assert!(super::plugin_supports_client_cursor(
+            v2,
+            &v2_header(super::CAP_CLIENT_CURSOR)
+        ));
+        // A plugin built before the handshake leaves the caps word zero.
+        assert!(!super::plugin_supports_client_cursor(v2, &v2_header(0)));
+        assert!(!super::plugin_supports_client_cursor(v2, &v2_header(2)));
+    }
+
+    #[test]
+    fn client_cursor_never_read_from_pre_v2_headers() {
+        // v1/legacy files have pixels at 160/24: byte 184 is pixel data.
+        let px = v2_header(u32::MAX);
+        assert!(!super::plugin_supports_client_cursor(
+            super::ShmCapture::HDR_SIZE_V1,
+            &px
+        ));
+        assert!(!super::plugin_supports_client_cursor(24, &px));
+        assert!(!super::plugin_supports_client_cursor(
+            super::ShmCapture::HDR_SIZE_V2,
+            &px[..186]
+        ));
+    }
+
+    #[test]
+    fn cursor_handshake_words_match_the_plugin_layout() {
+        // plugins/hyprland-capture/main.cpp HdrTail: releasedSeq ends at
+        // 184, caps @184, cursorReq @188, "UCSR" request magic.
+        assert_eq!(super::REL0_OFFSET + 16, super::CAPS_OFFSET);
+        assert_eq!(super::CAPS_OFFSET + 4, super::CURSOR_REQ_OFFSET);
+        assert_eq!(super::CURSOR_REQ_CLIENT, 0x5253_4355);
+    }
+
+    /// A plugin cursor shm snapshot (CursorHeader + rows).
+    fn cursor_shm(w: u32, h: u32, hot: (i32, i32), visible: u32, px: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 64];
+        let mut put = |o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_ne_bytes());
+        put(0, super::PluginCursor::MAGIC);
+        put(4, 1);
+        put(16, w);
+        put(20, h);
+        put(24, hot.0 as u32);
+        put(28, hot.1 as u32);
+        put(32, visible);
+        b[8..16].copy_from_slice(&2u64.to_ne_bytes());
+        b.extend_from_slice(px);
+        b
+    }
+
+    #[test]
+    fn plugin_cursor_decodes_shape_and_hotspot() {
+        // 2x1: opaque blue, half-transparent premultiplied red.
+        let px = [255, 0, 0, 255, 0, 0, 64, 128];
+        let Some(desk_backend::CursorUpdate::Shape(img)) =
+            super::parse_plugin_cursor(&cursor_shm(2, 1, (1, 0), 1, &px))
+        else {
+            panic!("expected a shape");
+        };
+        assert_eq!((img.width, img.height, img.hot_x, img.hot_y), (2, 1, 1, 0));
+        assert_eq!(&img.bgra[..4], &[255, 0, 0, 255]);
+        assert_eq!(img.bgra[7], 128);
+        assert_eq!(img.bgra[6], 128); // un-premultiplied: 64 * 255 / 128
+    }
+
+    #[test]
+    fn plugin_cursor_hidden_and_unusable_snapshots() {
+        assert_eq!(
+            super::parse_plugin_cursor(&cursor_shm(0, 0, (0, 0), 0, &[])),
+            Some(desk_backend::CursorUpdate::Hidden)
+        );
+        // Not written yet (zero magic), truncated pixels, oversized.
+        assert_eq!(super::parse_plugin_cursor(&[0u8; 64]), None);
+        assert_eq!(
+            super::parse_plugin_cursor(&cursor_shm(4, 4, (0, 0), 1, &[0; 8])),
+            None
+        );
+        assert_eq!(
+            super::parse_plugin_cursor(&cursor_shm(512, 1, (0, 0), 1, &[0; 2048])),
+            None
+        );
+    }
 
     #[test]
     fn lcid_maps_common_layouts() {

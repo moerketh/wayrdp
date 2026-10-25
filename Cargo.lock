@@ -32,6 +32,7 @@ name = "backend-wlroots"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clipboard-wayland",
  "crossbeam-channel",
  "desk-backend",
  "freerdp-sys",
@@ -121,6 +122,18 @@ dependencies = [
  "glob",
  "libc",
  "libloading",
+]
+
+[[package]]
+name = "clipboard-wayland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "desk-backend",
+ "libc",
+ "wayland-client",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]
