@@ -108,30 +108,26 @@ struct Target {
     char     sockPath[256];
 
     Target(const std::string& monName) {
-        // Shm names embed the per-boot random token (see shmToken): /dev/shm
-        // is world-writable, and a predictable name lets another local user
-        // pre-create the object so shmCreateOwned's ownership gate refuses
-        // takeover and capture is denied. With the token in the name, a
-        // cross-user squatter cannot know what to squat. Empty token (no
-        // usable XDG_RUNTIME_DIR) falls back to the legacy deterministic
-        // name — the reader (wayrdp backend-wlroots) makes the same
-        // decision, so both sides still agree on the path.
-        const std::string tok = shmToken();
-        if (tok.empty()) {
+        // Segments live under XDG_RUNTIME_DIR (tmpfs, 0700, user-owned):
+        // same shared-memory semantics as /dev/shm, but a different local
+        // user cannot pre-create the name — the /dev/shm squat attack
+        // (predictable name + ownership-gated takeover refusal = capture
+        // denial) has no purchase here. Without a runtime dir there is no
+        // safe location; capture for this monitor stays off (logged where
+        // shmCreateOwned fails). The reader (wayrdp backend-wlroots)
+        // derives the identical paths.
+        const char* rt = std::getenv("XDG_RUNTIME_DIR");
+        if (rt && *rt) {
             std::snprintf(shmPath, sizeof(shmPath),
-                          "/wayrdp-capture-%s", monName.c_str());
+                          "%s/wayrdp-capture-%s", rt, monName.c_str());
             std::snprintf(curPath, sizeof(curPath),
-                          "/wayrdp-cursor-%s", monName.c_str());
+                          "%s/wayrdp-cursor-%s", rt, monName.c_str());
         } else {
-            std::snprintf(shmPath, sizeof(shmPath),
-                          "/wayrdp-capture-%s-%s", monName.c_str(), tok.c_str());
-            std::snprintf(curPath, sizeof(curPath),
-                          "/wayrdp-cursor-%s-%s", monName.c_str(), tok.c_str());
+            shmPath[0] = '\0';
+            curPath[0] = '\0';
         }
         // Frame-notify datagram target (best-effort; nothing binds it yet).
-        // Under XDG_RUNTIME_DIR — a user-private dir — not world-writable
-        // /tmp, so a local user can't pre-create squatting paths.
-        const char* rt = std::getenv("XDG_RUNTIME_DIR");
+        // Same user-private runtime dir.
         const char* base = (rt && *rt) ? rt : "/tmp";
         std::snprintf(sockPath, sizeof(sockPath),
                       "%s/wayrdp-capture-%s.sock", base, monName.c_str());
@@ -141,67 +137,6 @@ struct Target {
 };
 
 static std::unordered_map<std::string, Target> g_targets;
-
-// Per-boot random token shared with wayrdp's backend-wlroots reader so the
-// /dev/shm object names are unguessable by other local users (see the
-// Target constructor). Stored as a 0600 file under the user-private
-// XDG_RUNTIME_DIR; whichever side needs it first creates it, the loser of
-// the create race adopts the winner's token. Returns "" when no usable
-// runtime dir exists — callers then use the legacy deterministic names.
-static std::string shmToken() {
-    static const std::string cached = []() -> std::string {
-        const char* rt = std::getenv("XDG_RUNTIME_DIR");
-        if (!rt || !*rt)
-            return std::string();
-        std::string path = std::string(rt) + "/wayrdp-shm-token";
-        // Adopt an existing token.
-        {
-            FILE* f = std::fopen(path.c_str(), "r");
-            if (f) {
-                char buf[33] = {0};
-                const size_t n = std::fread(buf, 1, 32, f);
-                std::fclose(f);
-                if (n > 0) {
-                    std::string tok(buf, n);
-                    while (!tok.empty() && (tok.back() == '\n' || tok.back() == ' '))
-                        tok.pop_back();
-                    if (!tok.empty())
-                        return tok;
-                }
-            }
-        }
-        // Create one: 16 random bytes, hex.
-        unsigned char rnd[16] = {0};
-        FILE* u = std::fopen("/dev/urandom", "r");
-        if (!u)
-            return std::string();
-        const bool ok = std::fread(rnd, 1, sizeof(rnd), u) == sizeof(rnd);
-        std::fclose(u);
-        if (!ok)
-            return std::string();
-        char tok[33] = {0};
-        for (size_t i = 0; i < sizeof(rnd); i++)
-            std::snprintf(tok + 2 * i, 3, "%02x", rnd[i]);
-        // O_CREAT|O_EXCL, 0600: lose a race with the daemon → adopt theirs.
-        const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (fd >= 0) {
-            const ssize_t w = ::write(fd, tok, 32);
-            close(fd);
-            if (w == 32)
-                return std::string(tok, 32);
-        }
-        FILE* f = std::fopen(path.c_str(), "r");
-        if (f) {
-            char buf[33] = {0};
-            const size_t n = std::fread(buf, 1, 32, f);
-            std::fclose(f);
-            if (n > 0)
-                return std::string(buf, n);
-        }
-        return std::string();
-    }();
-    return cached;
-}
 
 static bool g_cursorHooked = false; // both client-cursor hooks are live
 
@@ -357,39 +292,49 @@ static void shmTeardown(Target& t) {
         close(t.shmFd);
         t.shmFd = -1;
     }
-    shm_unlink(t.shmPath);
+    unlink(t.shmPath);
     t.shmSize = 0;
     t.frameW  = 0;
     t.frameH  = 0;
 }
 
-// Create `path` exclusively; returns the fd or -1.
+// Create `path` (a regular file under the 0700 runtime dir) exclusively;
+// returns the fd or -1.
 static int shmCreateOwned(const char* path) {
-    int fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (!path || !*path) {
+        Log::logger->log(Log::ERR,
+                         "[wayrdp-capture] no XDG_RUNTIME_DIR; nowhere to create the capture segment");
+        return -1;
+    }
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd >= 0)
         return fd;
-    // Stale shm from a previous plugin run? Take it over so the new
+    if (errno != EEXIST) {
+        Log::logger->log(Log::ERR, "[wayrdp-capture] open {} failed: {}", path, strerror(errno));
+        return -1;
+    }
+    // Stale segment from a previous plugin run? Take it over so the new
     // instance owns a fresh file. Ownership-gated: anything not owned by
     // us is treated as a hard failure, never silently unlinked.
-    // /dev/shm can contain symlinks (POSIX shm objects are tmpfs files);
-    // O_NOFOLLOW refuses them outright so the uid check below can never
-    // be satisfied by a link we followed. (S_ISLNK on an fstat result is
-    // structurally impossible — fstat reports the target — so it's gone.)
-    fd = shm_open(path, O_RDWR | O_NOFOLLOW, 0600);
+    // The runtime dir is user-private, so a foreign owner means something
+    // is very wrong — refuse rather than follow (O_NOFOLLOW rejects
+    // symlinks outright so the uid check below can never be satisfied by
+    // a link we followed).
+    fd = open(path, O_RDWR | O_NOFOLLOW, 0600);
     struct stat st {};
     if (fd < 0 || fstat(fd, &st) < 0 || st.st_uid != getuid()) {
         if (fd >= 0)
             close(fd);
         Log::logger->log(Log::ERR,
-                         "[wayrdp-capture] shm {} exists and is not ours; refusing takeover",
+                         "[wayrdp-capture] segment {} exists and is not ours; refusing takeover",
                          path);
         return -1;
     }
     close(fd);
-    shm_unlink(path);
-    fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    unlink(path);
+    fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0)
-        Log::logger->log(Log::ERR, "[wayrdp-capture] shm_open failed: {}", strerror(errno));
+        Log::logger->log(Log::ERR, "[wayrdp-capture] open {} failed: {}", path, strerror(errno));
     return fd;
 }
 
@@ -413,20 +358,21 @@ static bool shmSetup(Target& t, uint32_t w, uint32_t h) {
     if (ftruncate(fd, (off_t)need) != 0) {
         Log::logger->log(Log::ERR, "[wayrdp-capture] ftruncate failed: {}", strerror(errno));
         close(fd);
-        shm_unlink(t.shmPath);
+        unlink(t.shmPath);
         return false;
     }
     void* p = mmap(nullptr, need, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) {
         Log::logger->log(Log::ERR, "[wayrdp-capture] mmap failed: {}", strerror(errno));
         close(fd);
-        shm_unlink(t.shmPath);
+        unlink(t.shmPath);
         return false;
     }
 
-    // shm_open(O_EXCL) guarantees zero-filled contents, so the reader's
-    // releasedSeq words are already 0; be explicit anyway — a stale
-    // non-zero word would stall the first two publishes by up to 16ms.
+    // A fresh O_CREAT|O_EXCL file guarantees zero-filled contents, so the
+    // reader's releasedSeq words are already 0; be explicit anyway — a
+    // stale non-zero word would stall the first two publishes by up to
+    // 16ms.
     std::memset(reinterpret_cast<char*>(p) + sizeof(FrameHeader), 0,
                 HEADER_SIZE - sizeof(FrameHeader));
     reinterpret_cast<HdrTail*>(reinterpret_cast<char*>(p) + sizeof(FrameHeader))
@@ -457,7 +403,7 @@ static void cursorShmTeardown(Target& t) {
     if (t.curFd >= 0) {
         close(t.curFd);
         t.curFd = -1;
-        shm_unlink(t.curPath);
+        unlink(t.curPath);
     }
 }
 
@@ -470,14 +416,14 @@ static bool cursorShmSetup(Target& t) {
     if (ftruncate(fd, (off_t)CURSOR_SHM_SIZE) != 0) {
         Log::logger->log(Log::ERR, "[wayrdp-capture] cursor ftruncate failed: {}", strerror(errno));
         close(fd);
-        shm_unlink(t.curPath);
+        unlink(t.curPath);
         return false;
     }
     void* p = mmap(nullptr, CURSOR_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) {
         Log::logger->log(Log::ERR, "[wayrdp-capture] cursor mmap failed: {}", strerror(errno));
         close(fd);
-        shm_unlink(t.curPath);
+        unlink(t.curPath);
         return false;
     }
     t.curFd  = fd;

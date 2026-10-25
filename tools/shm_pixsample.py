@@ -10,6 +10,7 @@
 # when there's no live shm region (nobody connected -- expected if mis-timed).
 
 import glob
+import os
 import struct
 import sys
 
@@ -17,8 +18,17 @@ HEADER_SIZE = 384  # v3: FrameHeader(160) + HdrTail pad(96) + HdrCursor(128)
 MAGIC = 0x57524343  # "WCRC"
 
 
+def capture_paths():
+    # Segments live under the 0700 user-owned runtime dir (moved out of
+    # /dev/shm, where predictable names let another local user squat them).
+    rt = os.environ.get("XDG_RUNTIME_DIR", "")
+    if rt:
+        return sorted(glob.glob(os.path.join(rt, "wayrdp-capture-*")))
+    return []
+
+
 def main() -> int:
-    files = sorted(glob.glob("/dev/shm/wayrdp-capture-*"))
+    files = capture_paths()
     if not files:
         print("NONE no-shm-region")
         return 0

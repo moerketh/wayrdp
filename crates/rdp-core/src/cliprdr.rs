@@ -43,10 +43,25 @@ const MAX_LOCAL_ENTRIES: usize = 10_000;
 /// Entries accepted from a client FileGroupDescriptorW (host → guest
 /// downloads). Mirrors MAX_LOCAL_ENTRIES on the serving side.
 const MAX_REMOTE_ENTRIES: usize = 10_000;
-/// Aggregate byte budget for one host → guest download announcement. The
-/// client controls both the declared per-entry sizes and every response
-/// body, so without a budget a malicious peer can fill the user's disk.
-const MAX_DOWNLOAD_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
+/// Default aggregate byte budget for one host → guest download
+/// announcement. The client controls both the declared per-entry sizes and
+/// every response body, so without a budget a malicious peer can fill the
+/// user's disk. Operators who legitimately paste larger trees raise it with
+/// WAYRDP_DOWNLOAD_BUDGET_MB.
+const DEFAULT_DOWNLOAD_BUDGET_MB: u64 = 2 * 1024;
+
+/// Parsed once: WAYRDP_DOWNLOAD_BUDGET_MB, clamped to 1..=(1<<20) MiB.
+fn download_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let mb = std::env::var("WAYRDP_DOWNLOAD_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DOWNLOAD_BUDGET_MB)
+            .clamp(1, 1 << 20);
+        mb * 1024 * 1024
+    })
+}
 /// FILECONTENTS range size per request (host → guest downloads).
 const RANGE_CHUNK: u32 = 1024 * 1024;
 /// Largest range we serve per client request (guest → host).
@@ -190,6 +205,11 @@ impl Cliprdr {
             .name("wayrdp-clip-ev".into())
             .spawn(move || event_loop(w, ev_rx));
 
+        // Reap trees abandoned by earlier runs (teardown leaves staging in
+        // place so a disconnect can never delete files mid-read; see
+        // sweep_stale_staging). Only trees older than a day go.
+        sweep_stale_staging();
+
         let rc = wayrdp_cliprdr_start(ctx);
         let me = Box::new(Cliprdr {
             shared,
@@ -220,15 +240,11 @@ impl Drop for Cliprdr {
         self.shared.file_waiters.lock().unwrap().clear();
         self.shared.out_tx.lock().unwrap().take();
         self.shared.clipboard.lock().unwrap().take();
-        // Remove this peer's staging downloads: the channel is gone, so
-        // nothing can paste them anymore, and pasted-file trees otherwise
-        // accumulate in the cache directory forever. Best-effort — the
-        // paste may have already moved/consumed them.
-        for dir in self.shared.staging.lock().unwrap().drain(..) {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                eprintln!("[cliprdr] staging cleanup {}: {e}", dir.display());
-            }
-        }
+        // Staging is deliberately left on disk: a disconnect mid-paste must
+        // not delete files a local app may still be reading from the
+        // staging path. The next download sweeps this peer's superseded
+        // trees; a later channel start reaps anything older than a day.
+        self.shared.staging.lock().unwrap().clear();
     }
 }
 
@@ -652,6 +668,39 @@ fn staging_root() -> Option<PathBuf> {
     Some(base.join("wayrdp").join("clipboard"))
 }
 
+/// Reap staging trees older than `SweepAge` at channel start. Teardown
+/// deliberately leaves staging in place (a disconnect mid-paste must not
+/// delete files a local app is still reading); this sweep is what keeps
+/// abandoned trees from accumulating forever. Fresh trees — including any
+/// just created by a concurrent peer of the same user — are never touched.
+const STAGING_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+fn sweep_stale_staging() {
+    if let Some(root) = staging_root() {
+        sweep_dir(&root);
+    }
+}
+
+fn sweep_dir(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(md) = entry.metadata() else { continue };
+        if !md.is_dir() {
+            continue;
+        }
+        let stale = md
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > STAGING_SWEEP_AGE);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Fetch the client's file list and download every file into a fresh
 /// staging directory. Returns the top-level paths to hand to the paster.
 fn download_files(s: &Shared, files_format: u32, seq: u64) -> Option<Vec<PathBuf>> {
@@ -682,7 +731,10 @@ fn download_files(s: &Shared, files_format: u32, seq: u64) -> Option<Vec<PathBuf
     // Superseded staging trees from earlier announcements of this peer are
     // dead weight (files_cache only serves the newest seq); remove them so
     // one long-lived connection cannot accumulate one budget's worth per
-    // paste. The fresh dir is tracked for Drop-time cleanup.
+    // paste. NOTE: a tree the local user may still be reading (a slow copy
+    // out of the staging path) is NOT deleted on disconnect — teardown
+    // leaves staging alone, and a startup sweep reaps only old trees (see
+    // sweep_stale_staging).
     {
         let mut staging = s.staging.lock().unwrap();
         for old in staging.drain(..) {
@@ -694,10 +746,12 @@ fn download_files(s: &Shared, files_format: u32, seq: u64) -> Option<Vec<PathBuf
     }
 
     // The client controls every declared size AND every response body, so
-    // the budget is decremented by bytes actually written; an entry that
-    // cannot fit the remainder is skipped, and budget exhaustion mid-file
-    // aborts the announcement.
-    let mut remaining: u64 = MAX_DOWNLOAD_TOTAL;
+    // the budget is decremented by bytes actually written. An entry that
+    // cannot fit the budget fails the WHOLE paste visibly (an empty paste
+    // plus this log) rather than silently delivering a partial tree; an
+    // operator who legitimately transfers more raises the budget with
+    // WAYRDP_DOWNLOAD_BUDGET_MB.
+    let mut remaining: u64 = download_budget();
 
     let mut tops: Vec<PathBuf> = Vec::new();
     for (index, d) in descs.iter().enumerate() {
@@ -720,12 +774,13 @@ fn download_files(s: &Shared, files_format: u32, seq: u64) -> Option<Vec<PathBuf
         }
         if d.size > remaining {
             eprintln!(
-                "[cliprdr] entry {:?} declares {} bytes, over the announcement budget ({} left); skipping",
+                "[cliprdr] entry {:?} declares {} bytes, over the download budget ({} left of {}); failing the paste (raise with WAYRDP_DOWNLOAD_BUDGET_MB)",
                 d.name,
                 d.size,
-                remaining
+                remaining,
+                download_budget()
             );
-            continue;
+            return None;
         }
         if let Some(parent) = target.parent() {
             if std::fs::create_dir_all(parent).is_err() {
@@ -813,6 +868,35 @@ mod tests {
         // aggregate budget bounds every response body a peer can land on
         // disk for one announcement.
         assert_eq!(MAX_REMOTE_ENTRIES, MAX_LOCAL_ENTRIES);
-        assert!(MAX_DOWNLOAD_TOTAL >= u64::from(MAX_TEXT_BYTES as u64));
+        assert!(download_budget() >= MAX_TEXT_BYTES as u64);
+    }
+
+    #[test]
+    fn sweep_reaps_only_old_staging_trees() {
+        let root =
+            std::env::temp_dir().join(format!("wayrdp-cliprdr-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fresh = root.join("fresh-1-1");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join("f.txt"), b"x").unwrap();
+        let old = root.join("old-1-1");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("f.txt"), b"x").unwrap();
+        // Backdate the old tree past the sweep age.
+        let past =
+            std::time::SystemTime::now() - STAGING_SWEEP_AGE - std::time::Duration::from_secs(60);
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        // Sweep this root directly (sweep_stale_staging would use the
+        // process's real cache dir).
+        sweep_dir(&root);
+
+        assert!(fresh.exists(), "fresh tree must survive the sweep");
+        assert!(!old.exists(), "aged tree must be reaped");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

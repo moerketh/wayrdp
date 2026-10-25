@@ -816,6 +816,17 @@ unsafe fn start_session(client: *mut rdp_freerdp_peer, ctx: *mut PeerContext) ->
         // EGFX reset, and the session outlives those.
         return 1;
     };
+    // A Display-Control resize that arrived before Activate has already
+    // updated width/height (apply_disp_resize); open at the newest size.
+    let mut req = req;
+    if (*ctx).width != 0 && (*ctx).height != 0 {
+        let size = Size {
+            width: (*ctx).width,
+            height: (*ctx).height,
+        };
+        req.initial_size = size;
+        req.target = CaptureTarget::NewVirtualOutput(size);
+    }
     let mut session = match (state.open_session)(req) {
         Some(s) => s,
         None => return 0,
@@ -1022,8 +1033,12 @@ unsafe fn apply_disp_resize(ctx: *mut PeerContext) {
             }
         }
     } else {
+        // No session yet (Activate not run): remember the size —
+        // start_session opens with the current width/height, so a resize
+        // that raced activation still takes effect.
         (*ctx).width = w;
         (*ctx).height = h;
+        eprintln!("[disp_resize] pre-activation resize to {w}x{h}; applied at activate");
     }
 }
 

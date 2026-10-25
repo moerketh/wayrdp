@@ -2273,89 +2273,24 @@ fn plugin_supports_client_cursor(hdr_size: usize, header: &[u8]) -> bool {
             .is_some_and(|w| u32::from_ne_bytes(w.try_into().unwrap()) & CAP_CLIENT_CURSOR != 0)
 }
 
-/// Per-boot random token shared by the daemon and the in-compositor plugin
-/// so /dev/shm object names are unguessable: a cross-user squatter cannot
-/// pre-create `wayrdp-capture-*` (name squat denial-of-service) when the
-/// name embeds a 128-bit random value it cannot read. The token lives in a
-/// 0600 file under the user-private XDG_RUNTIME_DIR; whichever side needs
-/// it first creates it (O_EXCL, loser re-reads). A missing/unusable runtime
-/// dir falls back to the empty token, i.e. the legacy deterministic name —
-/// both sides make the same decision in the same session, so they still
-/// agree on the path.
-fn shm_token() -> String {
-    fn token_path() -> Option<std::path::PathBuf> {
-        let rt = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)?;
-        if rt.as_os_str().is_empty() {
-            return None;
-        }
-        Some(rt.join("wayrdp-shm-token"))
+/// Path of a capture/cursor segment shared with the plugin, under
+/// `$XDG_RUNTIME_DIR` — tmpfs (so mmap gives the same shared-memory
+/// semantics as /dev/shm) but 0700 and owned by the session user, so a
+/// different local user cannot pre-create the name (the /dev/shm squat
+/// denial-of-service). The plugin derives the identical path. None (and a
+/// logged refusal) when no runtime dir is set: there is no safe
+/// world-writable fallback, and a Wayland session without one cannot host
+/// capture anyway.
+fn shm_segment_path(kind: &str, output_name: &str) -> Option<std::path::PathBuf> {
+    let rt = std::env::var_os("XDG_RUNTIME_DIR")?;
+    if rt.is_empty() {
+        return None;
     }
-    use std::io::Read;
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let Some(path) = token_path() else {
-        return String::new();
-    };
-    if let Ok(mut f) = std::fs::File::open(&path) {
-        let mut buf = String::new();
-        if f.read_to_string(&mut buf).is_ok() && !buf.trim().is_empty() {
-            return buf.trim().to_string();
-        }
-    }
-    // Create it: 16 random bytes from /dev/urandom, hex-encoded, mode 0600.
-    let rnd: [u8; 16] = match std::fs::File::open("/dev/urandom") {
-        Ok(mut f) => {
-            let mut a = [0u8; 16];
-            match f.read_exact(&mut a) {
-                Ok(()) => a,
-                Err(_) => return String::new(),
-            }
-        }
-        Err(_) => return String::new(),
-    };
-    let token: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            let _ = f.write_all(token.as_bytes());
-        }
-        Err(_) => {
-            // Lost a create race (daemon vs plugin): adopt the winner's token.
-            if let Ok(mut f) = std::fs::File::open(&path) {
-                let mut buf = String::new();
-                if f.read_to_string(&mut buf).is_ok() && !buf.trim().is_empty() {
-                    return buf.trim().to_string();
-                }
-            }
-        }
-    }
-    token
-}
-
-/// Shared per-boot shm token (see shm_token); read once per process.
-fn shm_token_once() -> &'static str {
-    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TOKEN.get_or_init(shm_token)
-}
-
-/// /dev/shm object name for `kind` ("capture"/"cursor") on `output_name`,
-/// embedding the per-boot token when one exists (unguessable names) and
-/// falling back to the legacy deterministic name when not. The plugin
-/// derives the identical name with the identical rule.
-fn shm_object_name(kind: &str, output_name: &str, token: &str) -> String {
-    if token.is_empty() {
-        format!("/dev/shm/wayrdp-{kind}-{output_name}")
-    } else {
-        format!("/dev/shm/wayrdp-{kind}-{output_name}-{token}")
-    }
+    Some(std::path::PathBuf::from(rt).join(format!("wayrdp-{kind}-{output_name}")))
 }
 
 /// Cursor image the capture plugin publishes for a client-drawn cursor
-/// (`/dev/shm/wayrdp-cursor-<output>[-<token>]`, see CursorHeader in
+/// (`$XDG_RUNTIME_DIR/wayrdp-cursor-<output>`, see CursorHeader in
 /// plugins/hyprland-capture/main.cpp): magic u32, version u32, seq u64
 /// (seqlock), width u32, height u32, hot_x i32, hot_y i32, visible u32,
 /// then ARGB8888 rows from byte 64.
@@ -2369,8 +2304,8 @@ impl PluginCursor {
     const HDR: usize = 64;
     const MAX: u32 = 256;
 
-    fn path_for(output_name: &str) -> std::path::PathBuf {
-        shm_object_name("cursor", output_name, shm_token_once()).into()
+    fn path_for(output_name: &str) -> Option<std::path::PathBuf> {
+        shm_segment_path("cursor", output_name)
     }
 
     fn open(path: &std::path::Path) -> Option<Self> {
@@ -2527,13 +2462,13 @@ impl ShmCapture {
     const HDR_SIZE_V2: usize = 256;
     const ACTIVE_OFFSET: usize = 160;
 
-    /// Per-session shm path, keyed by this session's headless output name
-    /// plus the per-boot token (see shm_token). Two concurrent peers create
-    /// distinct wayrdp-N outputs; a shared path
+    /// Per-session segment path under $XDG_RUNTIME_DIR, keyed by this
+    /// session's headless output name (see shm_segment_path). Two
+    /// concurrent peers create distinct wayrdp-N outputs; a shared path
     /// makes the second (different-sized) peer read the first buffer and go
     /// black (observed with mstsc 1366x768 over a live 1920x1200 session).
-    fn path_for(output_name: &str) -> std::path::PathBuf {
-        shm_object_name("capture", output_name, shm_token_once()).into()
+    fn path_for(output_name: &str) -> Option<std::path::PathBuf> {
+        shm_segment_path("capture", output_name)
     }
 
     /// Open and mmap the shm; None if it doesn't exist yet or fails the
@@ -3010,7 +2945,8 @@ fn pump_loop(
     if use_shm_plugin {
         // Enter the shm-only pump loop: no ext-image-copy session, no shm
         // pool for Wayland capture. Still drive Wayland input + monitor
-        // lifecycle; pixel flow comes from /dev/shm/wayrdp-capture-<out>.
+        // lifecycle; pixel flow comes from the plugin's segment under
+        // $XDG_RUNTIME_DIR (wayrdp-capture-<out>).
         pump_loop_shm(
             state,
             event_queue,
@@ -3613,6 +3549,7 @@ fn pump_loop_shm(
     // read from the plugin's cursor shm.
     let mut cursor_requested = false;
     let mut cursor_unsupported_logged = false;
+    let mut shm_nowhere_logged = false;
     let mut plugin_cursor: Option<PluginCursor> = None;
     let mut cursor_open_at = std::time::Instant::now();
 
@@ -3687,7 +3624,9 @@ fn pump_loop_shm(
         if cursor_requested {
             if plugin_cursor.is_none() && cursor_open_at.elapsed().as_millis() >= 100 {
                 cursor_open_at = std::time::Instant::now();
-                plugin_cursor = PluginCursor::open(&PluginCursor::path_for(&state.output_name));
+                if let Some(path) = PluginCursor::path_for(&state.output_name) {
+                    plugin_cursor = PluginCursor::open(&path);
+                }
             }
             if let Some(update) = plugin_cursor.as_mut().and_then(|c| c.poll()) {
                 if state.cursor.publish(update) {
@@ -3715,8 +3654,9 @@ fn pump_loop_shm(
 
         // Open the shm if not yet open; the plugin may not have run yet.
         if shm.is_none() {
-            match ShmCapture::open(&ShmCapture::path_for(&state.output_name)) {
-                Some(s) => {
+            let path = ShmCapture::path_for(&state.output_name);
+            match path.map(|p| ShmCapture::open(&p)) {
+                Some(Some(s)) => {
                     eprintln!(
                         "[backend-wlroots] shm opened for {}: {}x{}",
                         state.output_name, s.width, s.height
@@ -3741,11 +3681,24 @@ fn pump_loop_shm(
                     }
                     shm = Some(s);
                 }
-                None => {
-                    // Plugin hasn't created shm yet. Give it some time to
-                    // appear (it only spawns when Hyprland renders a wayrdp
-                    // monitor after plugin load).
+                Some(None) => {
+                    // Plugin hasn't created the segment yet. Give it some
+                    // time to appear (it only spawns when Hyprland renders
+                    // a wayrdp monitor after plugin load).
                     std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue 'main;
+                }
+                None => {
+                    // No XDG_RUNTIME_DIR: there is no safe segment location
+                    // (a world-writable fallback would re-open the squat
+                    // attack this layout exists to prevent). Retry-park.
+                    if !shm_nowhere_logged {
+                        eprintln!(
+                            "[backend-wlroots] XDG_RUNTIME_DIR unset; nowhere to open the capture segment"
+                        );
+                        shm_nowhere_logged = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
                     continue 'main;
                 }
             }
@@ -3880,7 +3833,20 @@ fn pump_loop_shm(
                 // when the file's ctime ticked (i.e. at most once per second
                 // while the plugin recreates it, never on a healthy idle
                 // desktop).
-                let path = ShmCapture::path_for(&state.output_name);
+                let path = match ShmCapture::path_for(&state.output_name) {
+                    Some(p) => p,
+                    None => {
+                        // No runtime dir: there is no safe segment location.
+                        if !shm_nowhere_logged {
+                            eprintln!(
+                                "[backend-wlroots] XDG_RUNTIME_DIR unset; nowhere to open the capture segment"
+                            );
+                            shm_nowhere_logged = true;
+                        }
+                        last_frame_at = std::time::Instant::now();
+                        continue 'main;
+                    }
+                };
                 if shm
                     .as_ref()
                     .is_none_or(|s| s.maybe_stale() && s.is_stale(&path))
@@ -3982,27 +3948,30 @@ fn pump_loop_shm(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn shm_names_embed_the_token_and_fall_back_without_one() {
-        // With a token the name is unguessable by another local user; the
-        // plugin derives the identical name from the identical rule.
+    fn shm_names_live_under_the_runtime_dir_and_refuse_without_one() {
+        // Segments moved out of /dev/shm (mode 1777, listable: any local
+        // user could read a name suffix and pre-create the next one) into
+        // the 0700 user-owned runtime dir, where cross-user squatting is
+        // impossible. The plugin derives the identical path.
+        let rt = "/run/user/1000";
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: test-only env mutation; this crate is edition 2021 and
+        // the two assertions below run in this test alone.
+        std::env::set_var("XDG_RUNTIME_DIR", rt);
         assert_eq!(
-            super::shm_object_name("capture", "wayrdp-7", "0123abcd"),
-            "/dev/shm/wayrdp-capture-wayrdp-7-0123abcd"
+            super::shm_segment_path("capture", "wayrdp-7"),
+            Some(format!("{rt}/wayrdp-capture-wayrdp-7").into())
         );
         assert_eq!(
-            super::shm_object_name("cursor", "wayrdp-7", "0123abcd"),
-            "/dev/shm/wayrdp-cursor-wayrdp-7-0123abcd"
+            super::shm_segment_path("cursor", "wayrdp-7"),
+            Some(format!("{rt}/wayrdp-cursor-wayrdp-7").into())
         );
-        // No usable XDG_RUNTIME_DIR: legacy deterministic names, identical
-        // on both sides.
-        assert_eq!(
-            super::shm_object_name("capture", "wayrdp-7", ""),
-            "/dev/shm/wayrdp-capture-wayrdp-7"
-        );
-        assert_eq!(
-            super::shm_object_name("cursor", "wayrdp-7", ""),
-            "/dev/shm/wayrdp-cursor-wayrdp-7"
-        );
+        std::env::set_var("XDG_RUNTIME_DIR", "");
+        assert_eq!(super::shm_segment_path("capture", "wayrdp-7"), None);
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
     }
 
     #[test]
