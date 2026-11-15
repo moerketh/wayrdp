@@ -1,6 +1,6 @@
 //! Pure RDP → EIS input mapping, unit-tested without a compositor.
 
-use desk_backend::PointerButton;
+use desk_backend::{InputEvent, PointerButton};
 
 /// evdev button code for an RDP pointer button. Same codes as
 /// backend-wlroots so both backends behave alike.
@@ -73,6 +73,24 @@ pub fn region_position(x: i32, y: i32, region: (u32, u32, u32, u32, f64)) -> (f3
     (lx as f32, ly as f32)
 }
 
+/// Collapse runs of queued pointer motions to their newest position, never
+/// across another event: a click must land where the pointer was when the
+/// user clicked. A slow drain then costs no extra motion events (the cursor
+/// still ends up in the right place) instead of replaying every one.
+pub fn coalesce_motion(events: Vec<InputEvent>) -> Vec<InputEvent> {
+    let mut out: Vec<InputEvent> = Vec::with_capacity(events.len());
+    for ev in events {
+        if matches!(ev, InputEvent::PointerMotion { .. })
+            && matches!(out.last(), Some(InputEvent::PointerMotion { .. }))
+        {
+            *out.last_mut().expect("checked") = ev;
+        } else {
+            out.push(ev);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +140,30 @@ mod tests {
         assert_eq!(region_position(10, 10, off), (1930.0, 10.0));
         let hidpi = (0, 0, 960, 540, 2.0);
         assert_eq!(region_position(1000, 500, hidpi), (500.0, 250.0));
+    }
+
+    #[test]
+    fn motion_runs_collapse_but_not_across_clicks() {
+        let m = |x| InputEvent::PointerMotion { x, y: 0 };
+        let click = InputEvent::PointerButton {
+            button: PointerButton::Left,
+            pressed: true,
+        };
+        let out = coalesce_motion(vec![m(1), m(2), m(3), click, m(4), m(5)]);
+        let xs: Vec<String> = out.iter().map(|e| format!("{e:?}")).collect();
+        assert_eq!(
+            xs,
+            vec![
+                format!("{:?}", m(3)),
+                format!(
+                    "{:?}",
+                    InputEvent::PointerButton {
+                        button: PointerButton::Left,
+                        pressed: true
+                    }
+                ),
+                format!("{:?}", m(5)),
+            ]
+        );
     }
 }

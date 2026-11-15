@@ -8,7 +8,20 @@ description = "wayrdp KDE Plasma backend — adapter over hyperv-rdp-extras kwin
 
 [dependencies]
 desk-backend = { path = "../desk-backend" }
+input-keymap = { path = "../input-keymap" }
+clipboard-wayland = { path = "../clipboard-wayland" }
 # Pin discipline: validate a bumped extras rev before landing it here.
 hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "8dcaf6aea928d2123ac7ba0ece45082b62eeaa4e", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
+# Session task runtime: extras' kwin-virtual API is async and tokio::spawns
+# follow-up tasks (containment reattach) that need a live runtime.
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+# Frames from KWin's zkde-screencast node on the session PipeWire daemon.
+pipewire = "0.10"
+# Input via KWin's EIS endpoint: D-Bus for the fd, libei protocol in Rust.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+reis = "0.7"
+xkbcommon = "0.8"
+crossbeam-channel = "0.5.17"
+libc = "0.2"
 anyhow = "1"
 thiserror = "1"
