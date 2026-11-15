@@ -407,7 +407,7 @@ fn connect(
                 eprintln!("[backend-kde] capture: update_params failed: {e}");
             }
         })
-        .process(|stream, d| process(stream, d))
+        .process(process)
         .register()?;
 
     let format = enum_format();

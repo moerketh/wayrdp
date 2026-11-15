@@ -1,5 +1,5 @@
-//! Exit-code plumbing: unsupported desktops (KDE, Sway) bail out with this
-//! dedicated status so the systemd unit can mark it
+//! Exit-code plumbing: unsupported desktops (Sway), unknown backends and a
+//! too-old Plasma bail out with this dedicated status so the systemd unit can mark it
 //! `RestartPreventExitStatus=` instead of restarting every 5s forever.
 
 /// Exit status for "there is no working backend on this desktop, fix the

@@ -10,10 +10,10 @@
 //!   widens it. The pre-hardening code served an unauthenticated session on
 //!   0.0.0.0:3389; that must never happen implicitly again.
 //!
-//! Backend selection: `WAYRDP_BACKEND` env — `wlroots` (Hyprland, Track B)
-//! or `synthetic`. Unset = auto-detect from XDG_CURRENT_DESKTOP (F12):
-//! Hyprland→wlroots; KDE/Plasma and Sway are detected but have no working
-//! backend (KDE is unimplemented, wlroots drives Hyprland only), so startup
+//! Backend selection: `WAYRDP_BACKEND` env — `wlroots` (Hyprland), `kde`
+//! (Plasma 6.3+) or `synthetic`. Unset = auto-detect from
+//! XDG_CURRENT_DESKTOP (F12): Hyprland→wlroots, KDE→kde; Sway is detected
+//! but has no working backend (wlroots drives Hyprland only), so startup
 //! fails there with a clear error rather than showing a vmconnect user the
 //! synthetic test pattern. `WAYRDP_BACKEND=synthetic` is the escape hatch.
 //! These configuration errors exit with status 42 so systemd's
@@ -57,6 +57,19 @@ fn main() -> anyhow::Result<()> {
 
     let backend: Box<dyn desk_backend::DesktopBackend> = match selected_backend() {
         Ok(Backend::Wlroots) => Box::new(backend_wlroots::WlrBackend),
+        Ok(Backend::Kde) => {
+            use backend_kde::preflight::{preflight, Failure};
+            if let Err(f) = preflight() {
+                eprintln!("[wayrdp] kde backend: {f}");
+                std::process::exit(match f {
+                    Failure::Permanent(_) => selected_backend::EXIT_NO_BACKEND,
+                    Failure::Transient(_) => 1,
+                });
+            }
+            // Restore physical outputs a crashed previous run left disabled.
+            backend_kde::recovery::recover_at_startup();
+            Box::new(backend_kde::KdeBackend)
+        }
         Ok(Backend::Synthetic) => Box::new(rdp_core::synthetic::SyntheticBackend),
         Err(e) => {
             eprintln!("[wayrdp] {e:#}");
@@ -117,21 +130,22 @@ fn tcp_bind_ip() -> anyhow::Result<std::net::IpAddr> {
     }
 }
 
+#[derive(Debug)]
 enum Backend {
     Wlroots,
+    Kde,
     Synthetic,
 }
 
 /// Backend selection (F12): explicit `WAYRDP_BACKEND` wins; otherwise detect
 /// the compositor from XDG_CURRENT_DESKTOP so a stock install does the right
 /// thing. Auto-detection only maps compositors a backend can actually serve:
-/// KDE/Plasma and Sway are startup errors, not a silent test pattern — the
-/// KDE backend is a stub (`open` returns Unsupported) and the wlroots backend
+/// Sway is a startup error, not a silent test pattern — the wlroots backend
 /// drives Hyprland (`hyprctl`), so serving `synthetic` there would show a
 /// vmconnect user the test pattern instead of telling them nothing works.
 /// `WAYRDP_BACKEND=synthetic` is the explicit escape hatch. Explicitly asking
-/// for `kde`, or for a backend that doesn't exist (a typo), is a startup error,
-/// not a per-connection surprise or a silent test pattern.
+/// for a backend that doesn't exist (a typo) is a startup error, not a
+/// per-connection surprise or a silent test pattern.
 fn selected_backend() -> anyhow::Result<Backend> {
     let explicit = std::env::var("WAYRDP_BACKEND")
         .ok()
@@ -140,26 +154,36 @@ fn selected_backend() -> anyhow::Result<Backend> {
         return explicit_backend(&v);
     }
     let desktops = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let backend = detected_backend(&desktops)?;
+    if let Backend::Synthetic = backend {
+        eprintln!(
+            "[wayrdp] no supported compositor in XDG_CURRENT_DESKTOP={desktops:?}; \
+             serving the synthetic test backend (set WAYRDP_BACKEND to override)"
+        );
+    } else {
+        eprintln!("[wayrdp] backend auto-selected: {backend:?} (XDG_CURRENT_DESKTOP={desktops})");
+    }
+    Ok(backend)
+}
+
+/// Map an XDG_CURRENT_DESKTOP value (colon-separated) to a backend.
+fn detected_backend(desktops: &str) -> anyhow::Result<Backend> {
     for tag in desktops.split(':').map(str::trim) {
-        let t = tag.to_ascii_lowercase();
-        if t == "hyprland" {
-            eprintln!("[wayrdp] backend auto-selected: wlroots (XDG_CURRENT_DESKTOP={desktops})");
-            return Ok(Backend::Wlroots);
-        }
-        if t == "kde" || t == "plasma" || t == "sway" {
-            let e = anyhow::anyhow!(
-                "XDG_CURRENT_DESKTOP={desktops} has no working wayrdp backend \
-                 (KDE is unimplemented; the wlroots backend drives Hyprland) — \
-                 refusing to silently serve the synthetic test pattern. Set \
-                 WAYRDP_BACKEND=synthetic to force the test backend."
-            );
-            return Err(selected_backend::EXIT_NO_BACKEND.apply(e));
+        match tag.to_ascii_lowercase().as_str() {
+            "hyprland" => return Ok(Backend::Wlroots),
+            "kde" | "plasma" => return Ok(Backend::Kde),
+            "sway" => {
+                let e = anyhow::anyhow!(
+                    "XDG_CURRENT_DESKTOP={desktops} has no working wayrdp backend \
+                     (the wlroots backend drives Hyprland only) — refusing to \
+                     silently serve the synthetic test pattern. Set \
+                     WAYRDP_BACKEND=synthetic to force the test backend."
+                );
+                return Err(selected_backend::EXIT_NO_BACKEND.apply(e));
+            }
+            _ => {}
         }
     }
-    eprintln!(
-        "[wayrdp] no supported compositor in XDG_CURRENT_DESKTOP={desktops:?}; \
-         serving the synthetic test backend (set WAYRDP_BACKEND to override)"
-    );
     Ok(Backend::Synthetic)
 }
 
@@ -197,13 +221,10 @@ fn init_tracing() {
 fn explicit_backend(value: &str) -> anyhow::Result<Backend> {
     match value {
         "wlroots" => Ok(Backend::Wlroots),
+        "kde" => Ok(Backend::Kde),
         "synthetic" => Ok(Backend::Synthetic),
-        "kde" => Err(selected_backend::EXIT_NO_BACKEND.apply(anyhow::anyhow!(
-            "WAYRDP_BACKEND=kde: the KDE backend is not implemented \
-             (its `open` returns Unsupported); use wlroots or synthetic"
-        ))),
         other => Err(selected_backend::EXIT_NO_BACKEND.apply(anyhow::anyhow!(
-            "unknown WAYRDP_BACKEND={other:?}; use wlroots or synthetic"
+            "unknown WAYRDP_BACKEND={other:?}; use wlroots, kde or synthetic"
         ))),
     }
 }
@@ -361,6 +382,7 @@ mod tests {
     #[test]
     fn known_backend_values_resolve() {
         assert!(matches!(explicit_backend("wlroots"), Ok(Backend::Wlroots)));
+        assert!(matches!(explicit_backend("kde"), Ok(Backend::Kde)));
         assert!(matches!(
             explicit_backend("synthetic"),
             Ok(Backend::Synthetic)
@@ -368,8 +390,25 @@ mod tests {
     }
 
     #[test]
-    fn kde_and_typos_exit_with_no_backend_status() {
-        for value in ["kde", "wlroot", "Wlroots"] {
+    fn desktop_detection() {
+        assert!(matches!(detected_backend("Hyprland"), Ok(Backend::Wlroots)));
+        assert!(matches!(detected_backend("KDE"), Ok(Backend::Kde)));
+        assert!(matches!(detected_backend("ubuntu:KDE"), Ok(Backend::Kde)));
+        assert!(matches!(detected_backend("plasma"), Ok(Backend::Kde)));
+        assert!(matches!(detected_backend("GNOME"), Ok(Backend::Synthetic)));
+        assert!(matches!(detected_backend(""), Ok(Backend::Synthetic)));
+        let Err(e) = detected_backend("sway") else {
+            panic!("sway must not select a backend");
+        };
+        assert_eq!(
+            selected_backend::exit_code(&e),
+            selected_backend::EXIT_NO_BACKEND
+        );
+    }
+
+    #[test]
+    fn typos_exit_with_no_backend_status() {
+        for value in ["KDE", "wlroot", "Wlroots", "plasma"] {
             let Err(e) = explicit_backend(value) else {
                 panic!("{value} must not select a backend");
             };

@@ -17,6 +17,7 @@ pub mod capture;
 pub mod health;
 pub mod input;
 pub mod input_map;
+pub mod preflight;
 pub mod recovery;
 pub mod resize;
 pub mod session;
