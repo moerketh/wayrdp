@@ -75,8 +75,10 @@ function Verdict {
 }
 
 # "name enabled|disabled" per output, ANSI stripped.
-# Column layout differs across Plasma versions; only the name ($3) is fixed.
-$LayoutCmd = 'kscreen-doctor -o 2>/dev/null | sed "s/\x1b\[[0-9;]*m//g" | awk ''/^Output:/ {s="disabled"; for (i = 4; i <= NF; i++) if ($i == "enabled") s = "enabled"; print $3, s}'''
+# Layout differs across Plasma versions: older kscreen-doctor puts
+# "enabled" on the Output: line, 6.7 prints a UUID there and each attribute
+# on its own tab-indented line. Only the name ($3) is fixed.
+$LayoutCmd = 'kscreen-doctor -o 2>/dev/null | sed "s/\x1b\[[0-9;]*m//g" | awk ''function out() { if (name != "") print name, s } /^Output:/ { out(); name = $3; s = "disabled"; for (i = 4; i <= NF; i++) if ($i == "enabled") s = "enabled"; next } NF == 1 && $1 == "enabled" { s = "enabled" } END { out() }'''
 function Layout {
     $map = @{}
     foreach ($l in ((Guest $LayoutCmd) -split "`r?`n")) {
