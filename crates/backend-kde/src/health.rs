@@ -159,6 +159,11 @@ impl Health {
                 Action::None
             }
             Observation::LayoutSettled(at) => {
+                // A later settle point (planned plasmashell restart) also
+                // voids a streak begun before it: those frames never count.
+                if self.uniform_since.is_some_and(|(t, _)| t < at) {
+                    self.uniform_since = None;
+                }
                 self.settled_at = Some(at);
                 Action::None
             }
@@ -358,6 +363,33 @@ mod tests {
                 Action::None
             );
         }
+    }
+
+    #[test]
+    fn a_later_settle_point_voids_the_streak_before_it() {
+        let mut h = Health::new();
+        let t = t0();
+        uniform_session(&mut h, t, Uniform::Solid);
+        // Planned plasmashell restart at t+3 s: blank until t+7.5 s is fine.
+        h.observe(Observation::LayoutSettled(t + s(7_500)));
+        for ms in [600, 4_000, 6_000, 7_000] {
+            h.observe(Observation::Frame {
+                sample: Sample::Uniform(Uniform::Solid),
+                at: t + s(ms),
+            });
+            assert_eq!(h.observe(Observation::Tick(t + s(ms))), Action::None);
+        }
+        // Still blank a full streak after the new settle point: heal.
+        for ms in [8_000, 10_000, 11_600] {
+            h.observe(Observation::Frame {
+                sample: Sample::Uniform(Uniform::Solid),
+                at: t + s(ms),
+            });
+        }
+        assert_eq!(
+            h.observe(Observation::Tick(t + s(12_100))),
+            Action::Heal { escalate: false }
+        );
     }
 
     /// Regression: capture samples ~1/s after the connect window, and the

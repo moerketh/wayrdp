@@ -21,6 +21,7 @@ pub mod preflight;
 pub mod recovery;
 pub mod resize;
 pub mod session;
+pub mod shell;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

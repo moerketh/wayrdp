@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Oldest KWin the backend is validated against (Parrot's Plasma 6.3.6).
@@ -126,7 +127,14 @@ fn screencast_granted() -> bool {
     false
 }
 
-fn kwin_version() -> Option<(u32, u32, u32)> {
+static KWIN_VERSION: OnceLock<Option<(u32, u32, u32)>> = OnceLock::new();
+
+/// The running KWin's version (`kwin_wayland --version`), probed once.
+pub fn kwin_version() -> Option<(u32, u32, u32)> {
+    *KWIN_VERSION.get_or_init(probe_kwin_version)
+}
+
+fn probe_kwin_version() -> Option<(u32, u32, u32)> {
     let out = Command::new("kwin_wayland")
         .arg("--version")
         .output()

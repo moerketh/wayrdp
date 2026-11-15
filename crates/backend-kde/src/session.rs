@@ -29,6 +29,7 @@ use crate::health::{Action, Health, Observation, Sample};
 use crate::input::Input;
 use crate::recovery::KSCREEN_NAME;
 use crate::resize::{sanitize, Coalescer};
+use crate::{preflight, shell};
 
 /// Name passed to zkde `stream_virtual_output` (kscreen: `Virtual-wayrdp`).
 pub const OUTPUT_NAME: &str = "wayrdp";
@@ -295,6 +296,13 @@ async fn session(s: Session) {
     );
     let settled = Instant::now().max(started + CREATE_SETTLE);
     live.health.observe(Observation::LayoutSettled(settled));
+    // Plasma 6.7's folder view breaks on the containment move; one
+    // plasmashell restart once the swap has settled rebuilds it (shell.rs).
+    let kwin = preflight::kwin_version();
+    let mut shell_restart_at = shell::Policy::from_env().restart(kwin).then_some(settled);
+    if shell_restart_at.is_some() {
+        eprintln!("[backend-kde] session: plasmashell restart scheduled after the swap ({kwin:?})");
+    }
 
     let mut tick = tokio::time::interval(TICK);
     let mut input_noted = false;
@@ -354,6 +362,21 @@ async fn session(s: Session) {
                 if !live.act(action).await {
                     break;
                 }
+            }
+            _ = tokio::time::sleep_until(shell_restart_at.unwrap_or_else(Instant::now).into()),
+                if shell_restart_at.is_some() =>
+            {
+                shell_restart_at = None;
+                let t = Instant::now();
+                eprintln!("[backend-kde] session: restarting plasmashell (folder view after the swap)");
+                let ok = heal_output_layout(KSCREEN_NAME, true).await;
+                eprintln!(
+                    "[backend-kde] session: plasmashell restart done in {} ms, origin verified: {ok}",
+                    t.elapsed().as_millis()
+                );
+                // The shell repaints over the next seconds: not a fault.
+                live.health
+                    .observe(Observation::LayoutSettled(Instant::now() + CREATE_SETTLE));
             }
             _ = tokio::time::sleep_until(due.unwrap_or_else(Instant::now).into()), if due.is_some() => {
                 if let Some(size) = live.coalescer.due(Instant::now()) {
