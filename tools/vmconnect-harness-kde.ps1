@@ -198,7 +198,13 @@ $giveUp = Count $trace 'no usable stream|did not release in|session: virtual out
 Assert "K6-no-give-up" ($giveUp -eq 0) "give-up / lease-refusal / create-failure lines: $giveUp"
 $heals = Count $trace 'health: layout heal'
 if ($heals -gt 0) { $results.Add("[INFO] K6-heals :: $heals layout heal(s) this session") }
-Assert "K2b-eis-connected" ((Count $trace 'input: EIS connected') -ge 1) "'input: EIS connected' present (key delivery not asserted)"
+Assert "K2b-eis-connected" ((Count $trace 'input: EIS connected') -ge 1) "'input: EIS connected' present"
+# A connection alone proved nothing: a seat lost in the handshake buffer left
+# EIS connected with zero devices and every event dropped (dead mouse in
+# vmconnect while this suite was green). Require the devices to show up.
+$devLines = [regex]::Matches($trace, 'input: EIS device [^\r\n]*') | ForEach-Object { $_.Value }
+Assert "K2c-eis-devices" (@($devLines).Count -ge 1) "devices: $(if ($devLines) { ($devLines | Select-Object -Unique) -join '; ' } else { 'none (seat never bound)' })"
+Assert "K2d-eis-keymap" ((Count $trace 'input: guest keymap layout') -ge 1) "keyboard device delivered a keymap"
 $teardown = Count $trace 'teardown: done'
 $layout1 = Layout
 $phys1 = EnabledPhysical $layout1

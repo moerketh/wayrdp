@@ -231,9 +231,21 @@ fn compile_keymap(keymap: &reis::event::Keymap) -> Option<KeymapInfo> {
 impl Eis {
     /// Read the socket and process every pending event. Err = hung up.
     fn dispatch(&mut self) -> anyhow::Result<()> {
-        if self.context.read()? == 0 {
-            anyhow::bail!("EIS socket closed");
+        match self.context.read() {
+            Ok(0) => anyhow::bail!("EIS socket closed"),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
         }
+        self.process_buffered()
+    }
+
+    /// Process events already read into the context's buffer. Must run once
+    /// right after the handshake: the handshake's read also pulls in the
+    /// seat KWin sends straight after it, and those bytes never make the
+    /// socket readable again, so waiting for poll() would never bind the
+    /// seat and no device would ever appear (input silently dropped).
+    fn process_buffered(&mut self) -> anyhow::Result<()> {
         while let Some(result) = self.context.pending_event() {
             match result {
                 reis::PendingRequestResult::Request(ev) => self.converter.handle_event(ev)?,
@@ -483,10 +495,18 @@ fn run(rx: Receiver<Msg>, wake: Arc<OwnedFd>, input_seen: Arc<AtomicBool>) {
         if want && eis.is_none() && retry.is_none_or(|(at, _)| Instant::now() >= at) {
             let attempt = retry.map_or(0, |(_, n)| n);
             match connect_eis() {
-                Ok(e) => {
+                Ok(mut e) => {
                     eprintln!("[backend-kde] input: EIS connected (cookie {})", e.cookie);
-                    eis = Some(e);
-                    retry = None;
+                    match e.process_buffered() {
+                        Ok(()) => {
+                            eis = Some(e);
+                            retry = None;
+                        }
+                        Err(err) => {
+                            eprintln!("[backend-kde] input: {err:#}; reconnecting");
+                            retry = Some((Instant::now() + Duration::from_secs(1), attempt + 1));
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("[backend-kde] input: EIS connect failed: {e:#}");
