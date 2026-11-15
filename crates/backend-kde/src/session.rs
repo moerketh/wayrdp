@@ -249,6 +249,12 @@ async fn session(s: Session) {
         let _ = capture.send(Command::Shutdown);
         return;
     };
+    // The peer may have gone while we waited for the previous session.
+    if control.shutdown.load(Ordering::SeqCst) {
+        eprintln!("[backend-kde] session: client left before the output was created");
+        let _ = capture.send(Command::Shutdown);
+        return;
+    }
 
     let cfg = VirtualOutputConfig::new(OUTPUT_NAME);
     let (initial, clamped) = sanitize(initial);
