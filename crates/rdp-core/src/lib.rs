@@ -148,20 +148,28 @@ impl Server {
             // same listener; its accept path is transport-generic and marks
             // AF_VSOCK peers local (skips hostname lookup). Graceful no-op
             // on kernels without hv_sock.
+            let mut vsock_bound = false;
             if self.vsock {
-                match vsock::create_listener(bind_port as u32) {
-                    Some(fd) => {
-                        let open_from =
-                            (*listener).OpenFromSocket.expect("listener.OpenFromSocket");
-                        anyhow::ensure!(
-                            open_from(listener, fd) != 0,
-                            "listener.OpenFromSocket (vsock fd {}) failed",
-                            fd,
-                        );
-                    }
-                    None => {} // vsock::create_listener already logged why
+                // None: vsock::create_listener already logged why.
+                if let Some(fd) = vsock::create_listener(bind_port as u32) {
+                    let open_from = (*listener).OpenFromSocket.expect("listener.OpenFromSocket");
+                    anyhow::ensure!(
+                        open_from(listener, fd) != 0,
+                        "listener.OpenFromSocket (vsock fd {}) failed",
+                        fd,
+                    );
+                    vsock_bound = true;
                 }
             }
+            // With no listener the loop below would see zero handles and
+            // return Ok: exit 0, which Restart=on-failure never retries. Fail
+            // instead, so a port held at boot (EADDRINUSE) gets retried.
+            anyhow::ensure!(
+                self.tcp || vsock_bound,
+                "no listener: the vsock bind on port {} failed and TCP is off \
+                 (another RDP server holding the port?)",
+                bind_port
+            );
 
             loop {
                 let mut handles: [freerdp_sys::HANDLE; 64] = [std::ptr::null_mut(); 64];
