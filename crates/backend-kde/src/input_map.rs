@@ -60,6 +60,30 @@ pub fn lock_taps(current: Option<Locks>, wanted_bits: u8) -> Vec<u32> {
     taps
 }
 
+/// One EIS absolute region: `x, y, width, height`, its scale, mapping id.
+pub type Region<'a> = (u32, u32, u32, u32, f64, Option<&'a str>);
+
+/// Choose the region that is our virtual output. KWin may list several:
+/// 6.3 creates the absolute device while the physical output is still on,
+/// and 6.7 parks the virtual output beside it for a moment. Prefer the
+/// mapping id (`Virtual-wayrdp`, set by 6.7), then a region of exactly the
+/// session size (6.3 sets no ids), then the first.
+pub fn pick_region(regions: &[Region<'_>], mapping: &str, session: (u32, u32)) -> Option<usize> {
+    // Region sizes are logical; the session size is in pixels.
+    let pixels = |r: &Region<'_>| {
+        let s = if r.4 > 0.0 { r.4 } else { 1.0 };
+        (
+            (r.2 as f64 * s).round() as u32,
+            (r.3 as f64 * s).round() as u32,
+        )
+    };
+    regions
+        .iter()
+        .position(|r| r.5 == Some(mapping))
+        .or_else(|| regions.iter().position(|r| pixels(r) == session))
+        .or(if regions.is_empty() { None } else { Some(0) })
+}
+
 /// Clamp a session-space pointer position into an EIS absolute region
 /// (`x, y, width, height` in logical pixels, plus its scale) and translate
 /// it to the region's coordinate space.
@@ -94,6 +118,28 @@ pub fn coalesce_motion(events: Vec<InputEvent>) -> Vec<InputEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picks_the_virtual_output_region() {
+        // Parrot / KWin 6.3: physical first, no mapping ids.
+        let parrot = [(0, 0, 1920, 1080, 1.0, None), (0, 0, 800, 600, 1.0, None)];
+        assert_eq!(pick_region(&parrot, "Virtual-wayrdp", (800, 600)), Some(1));
+        // Kali / KWin 6.7: virtual parked beside the physical, with an id.
+        let kali = [
+            (0, 0, 1920, 1080, 1.0, Some("Virtual-1")),
+            (1920, 0, 1920, 1080, 1.0, Some("Virtual-wayrdp")),
+        ];
+        assert_eq!(pick_region(&kali, "Virtual-wayrdp", (1920, 1080)), Some(1));
+        // Scaled output: logical 1280x720 at 1.5 = 1920x1080 pixels.
+        let scaled = [(0, 0, 2560, 1440, 1.0, None), (0, 0, 1280, 720, 1.5, None)];
+        assert_eq!(
+            pick_region(&scaled, "Virtual-wayrdp", (1920, 1080)),
+            Some(1)
+        );
+        // Nothing matches: first region; nothing at all: none.
+        assert_eq!(pick_region(&parrot, "Virtual-wayrdp", (1024, 768)), Some(0));
+        assert_eq!(pick_region(&[], "Virtual-wayrdp", (800, 600)), None);
+    }
 
     #[test]
     fn buttons_match_backend_wlroots() {

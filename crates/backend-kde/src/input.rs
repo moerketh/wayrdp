@@ -42,6 +42,8 @@ enum Msg {
     /// Connect (or reconnect) to EIS; sent once the virtual output exists so
     /// the absolute region covers it.
     Connect,
+    /// Current virtual output size, used to pick the right absolute region.
+    Size(u32, u32),
     Shutdown,
 }
 
@@ -102,6 +104,11 @@ impl Input {
 
     pub fn connect(&self) {
         self.send(Msg::Connect);
+    }
+
+    /// The virtual output was created or resized to `width x height`.
+    pub fn set_size(&self, width: u32, height: u32) {
+        self.send(Msg::Size(width, height));
     }
 
     /// Release held keys, close EIS, join the thread. Idempotent.
@@ -364,18 +371,38 @@ impl Eis {
         self.frame(&dev);
     }
 
-    fn inject(&mut self, ev: &InputEvent, keys_down: &mut HashSet<u32>, debug: bool) {
+    fn inject(
+        &mut self,
+        ev: &InputEvent,
+        keys_down: &mut HashSet<u32>,
+        session: (u32, u32),
+        debug: bool,
+    ) {
         match ev {
             InputEvent::PointerMotion { x, y } => {
                 let Some((dev, abs)) = self.device_with::<ei::PointerAbsolute>() else {
                     return;
                 };
-                let (px, py) = match dev.regions().first() {
-                    Some(r) => input_map::region_position(
-                        *x,
-                        *y,
-                        (r.x, r.y, r.width, r.height, r.scale as f64),
-                    ),
+                let regions: Vec<input_map::Region<'_>> = dev
+                    .regions()
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.x,
+                            r.y,
+                            r.width,
+                            r.height,
+                            r.scale as f64,
+                            r.mapping_id.as_deref(),
+                        )
+                    })
+                    .collect();
+                let picked =
+                    input_map::pick_region(&regions, crate::recovery::KSCREEN_NAME, session);
+                let (px, py) = match picked.map(|i| regions[i]) {
+                    Some((rx, ry, rw, rh, scale, _)) => {
+                        input_map::region_position(*x, *y, (rx, ry, rw, rh, scale))
+                    }
                     None => (*x as f32, *y as f32),
                 };
                 abs.motion_absolute(px, py);
@@ -489,6 +516,7 @@ fn run(rx: Receiver<Msg>, wake: Arc<OwnedFd>, input_seen: Arc<AtomicBool>) {
     let mut retry: Option<(Instant, usize)> = None;
     let mut keys_down = HashSet::new();
     let mut pending: Vec<InputEvent> = Vec::new();
+    let mut session = (0u32, 0u32);
 
     'main: loop {
         // (Re)connect when asked, with backoff after failures.
@@ -563,6 +591,7 @@ fn run(rx: Receiver<Msg>, wake: Arc<OwnedFd>, input_seen: Arc<AtomicBool>) {
                     want = true;
                     retry = None;
                 }
+                Msg::Size(w, h) => session = (w, h),
                 Msg::Input(ev) => pending.push(ev),
             }
         }
@@ -571,7 +600,7 @@ fn run(rx: Receiver<Msg>, wake: Arc<OwnedFd>, input_seen: Arc<AtomicBool>) {
             let batch = input_map::coalesce_motion(std::mem::take(&mut pending));
             if let Some(e) = eis.as_mut() {
                 for ev in &batch {
-                    e.inject(ev, &mut keys_down, debug);
+                    e.inject(ev, &mut keys_down, session, debug);
                 }
                 let _ = e.context.flush();
             }

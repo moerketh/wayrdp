@@ -284,6 +284,7 @@ async fn session(s: Session) {
         return;
     };
     live.connected(node);
+    input.set_size(initial.width, initial.height);
     input.connect();
     let mut guard = OutputLayoutGuard::engage_with(cfg).await;
     eprintln!(
@@ -299,7 +300,14 @@ async fn session(s: Session) {
     let mut input_noted = false;
     let mut first_frame = true;
     let mut last_sample: Option<Sample> = None;
+    let mut input_size = initial;
     loop {
+        // Keep input's region choice in step with resizes and recreates.
+        let current = live.coalescer.current();
+        if current != input_size {
+            input_size = current;
+            input.set_size(current.width, current.height);
+        }
         let due = live.coalescer.deadline();
         tokio::select! {
             _ = control.notify.notified() => {
