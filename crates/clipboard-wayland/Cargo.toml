@@ -4,12 +4,15 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "wayrdp session clipboard over wlr-data-control (Hyprland, Sway, KDE)"
+description = "wayrdp session clipboard over ext/wlr data-control (KWin, Hyprland, Sway)"
 
 [dependencies]
 desk-backend = { path = "../desk-backend" }
 # Same wayland-client line as backend-wlroots (one version per lockfile).
 wayland-client = "0.31"
+# ext-data-control (KWin >= 6.4) lives in staging; wlr-data-control is the
+# fallback for Hyprland, Sway and older KWin.
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 crossbeam-channel = "0.5.17"
 libc = "0.2"
