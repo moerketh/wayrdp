@@ -373,12 +373,13 @@ public class VmConnectProbe {
     }
 
     public static int Main(string[] args) {
-        if (args.Length < 2) { Console.WriteLine("usage: vmconnect-probe <vmGuid> <serviceGuid> [--seconds N] [--send-input] [--neg-ssl] [--die-at-stage N]"); return 2; }
+        if (args.Length < 2) { Console.WriteLine("usage: vmconnect-probe <vmGuid> <serviceGuid> [--seconds N] [--send-input] [--neg-ssl] [--right-click SECS] [--die-at-stage N]"); return 2; }
         int settleSec = 2;
         for (int i = 2; i < args.Length; i++) {
             if (args[i] == "--seconds" && i + 1 < args.Length) settleSec = int.Parse(args[++i]);
             else if (args[i] == "--send-input") sendInput = true;
             else if (args[i] == "--neg-ssl") negSsl = true;
+            else if (args[i] == "--right-click" && i + 1 < args.Length) rightClickAfter = int.Parse(args[++i]);
             else if (args[i] == "--die-at-stage" && i + 1 < args.Length) dieAtStage = int.Parse(args[++i]);
         }
         Guid vmId = new Guid(args[0]);
@@ -571,8 +572,28 @@ public class VmConnectProbe {
             // then its rdpgfx Create Request. The real vmconnect client opens
             // EGFX immediately; wayrdp only starts EGFX frame flow
             // (send_frame_gfx) after this point.
-            var holdEnd = Environment.TickCount + settleSec * 1000;
+            // S9c, desktop right-click (opt-in via --right-click N): N
+            // seconds into the hold (past the KDE backend's screen swap,
+            // ~5 s), right-click the middle of the desktop and close the menu
+            // with Escape. The KDE harness then checks plasmashell's log: a
+            // folder view broken by the swap logs a FolderViewLayer error and
+            // shows a three-entry menu (KWin 6.7 / Kali). Done inside the
+            // hold so drdynvc/EGFX keep being answered while we wait.
+            var holdStart = Environment.TickCount;
+            var holdEnd = holdStart + settleSec * 1000;
+            bool rightClicked = rightClickAfter <= 0;
             while (Environment.TickCount < holdEnd) {
+                if (!rightClicked && Environment.TickCount - holdStart >= rightClickAfter * 1000) {
+                    rightClicked = true;
+                    try {
+                        SendRightClick(s, userId, shareId, 400, 250);
+                        Thread.Sleep(1500);
+                        SendScancodeKey(s, userId, shareId, 0x01);  // Escape
+                        Console.WriteLine("[probe] input sent: right-click at 400,250 then Escape");
+                    } catch (Exception iex) {
+                        Console.WriteLine("[probe] WARN right-click failed: " + iex.Message);
+                    }
+                }
                 var hp = ReadTpktHandlingDvc(stream, Math.Min(500, Math.Max(50, holdEnd - Environment.TickCount)));
                 if (hp != null) {
                     int hch = (hp.Length > 12 && hp[7] == 0x68) ? ((hp[10] << 8) | hp[11]) : -1;
@@ -783,6 +804,7 @@ public class VmConnectProbe {
     static bool s_capsDone = false;
     static int s_rdpgfxChanId = -1;
     static bool sendInput = false;
+    static int rightClickAfter = 0;
 
     // Input burst on the slow path (Share Control, pduType2=0x1C = Input).
     // TS_INPUT_PDU_DATA (MS-RDPBCGR 2.2.8.1.1.3.1) as ACTUALLY parsed by
@@ -799,6 +821,22 @@ public class VmConnectProbe {
     // wayrdp's peer_input_keyboard handles the scancode path (the unicode path
     // is a deliberate no-op in the backend), so a scancode 'z' (0x2C) reaches
     // the focused widget and A2b can grep it in the sink log.
+    // Slow-path TS_POINTER_EVENTs: move to (x,y), right button down, up.
+    static void SendRightClick(IntPtr s, int userId, uint shareId, ushort x, ushort y) {
+        var body = new List<byte>();
+        AddU16(body, 3);               // numEvents
+        AddU16(body, 0x0000);          // pad2Octets
+        ushort[] flags = { 0x0800, 0x8000 | 0x2000, 0x2000 };  // MOVE; DOWN|BUTTON2; BUTTON2
+        foreach (var f in flags) {
+            AddU32(body, 0);           // eventTime
+            AddU16(body, 0x8001);      // messageType = INPUT_EVENT_MOUSE
+            AddU16(body, f);           // pointerFlags
+            AddU16(body, x);
+            AddU16(body, y);
+        }
+        SendAll(s, ShareControlPdu(userId, 0x17, DataPdu(shareId, 0x1C, body.ToArray())));
+    }
+
     static void SendScancodeKey(IntPtr s, int userId, uint shareId, ushort keyCode) {
         var body = new List<byte>();
         AddU16(body, 2);               // numEvents = 2 (press + release)

@@ -24,6 +24,10 @@
 #   K6  no give-up    - no "no usable stream" / lease refusal this run
 #   K2b input         - EIS connected (key delivery itself is not asserted:
 #                       there is no compositor-neutral focus control yet)
+#   K10 folder view   - a desktop right-click during the hold logs no
+#                       FolderViewLayer error from plasmashell (Plasma 6.7
+#                       breaks the folder view on the screen swap; wayrdp
+#                       restarts plasmashell once on KWin >= 6.7)
 #   K7  teardown      - "teardown: done"; Virtual-wayrdp gone and the
 #                       baseline physical outputs enabled again
 #   K8  churn         - 6 rapid 2 s connects; afterwards the same KWin pid,
@@ -42,6 +46,7 @@
 param(
     [string]$VmName      = "wayrdp-kde-*",
     [int]$HoldSec        = 15,       # > extras' 4 s reattach + layout settle
+    [int]$RightClickSec  = 10,       # into the hold: after the plasmashell restart (0 = off)
     [int]$GateWaitSec    = 8,        # teardown restores outputs (~1-2 s) + slack
     [string]$GuestUser   = "vmcreate",
     [string]$GuestIp     = "",
@@ -160,13 +165,14 @@ $tmpOk = (Guest 'echo probe > /tmp/.k0-probe && rm -f /tmp/.k0-probe && df -m --
 Assert "K0h-tmp-headroom" ($tmpOk -ge 100) "/tmp writable, free=${tmpOk}M (need >= 100M)"
 if ($failed) { Write-Host "[harness-kde] guest unhealthy - fix before the RDP test"; Verdict }
 $coreEpoch = (Guest 'date +%s').Trim()
+$kwin67 = $kwinVer -match 'kwin\S* (\d+)\.(\d+)' -and (([int]$Matches[1] -gt 6) -or ([int]$Matches[1] -eq 6 -and [int]$Matches[2] -ge 7))
 
 # --- A1: one held session, layout sampled during the hold -------------------
 $mark = Mark
 $probeJob = Start-Job -ScriptBlock {
     $p = $args[0]; $rest = $args[1..($args.Count - 1)]
     & $p @rest 2>&1 | Out-String
-} -ArgumentList @($probe, $vmGuidStr, $rdpGuid, '--seconds', "$HoldSec", '--send-input', '--neg-ssl')
+} -ArgumentList @($probe, $vmGuidStr, $rdpGuid, '--seconds', "$HoldSec", '--send-input', '--neg-ssl', '--right-click', "$RightClickSec")
 $sawVirtual = $false; $sawGuarded = $false; $holdSamples = 0
 $deadline = (Get-Date).AddSeconds($HoldSec + 25)
 while ((Get-Date) -lt $deadline -and $probeJob.State -eq 'Running') {
@@ -207,6 +213,20 @@ Assert "K2b-eis-connected" ((Count $trace 'input: EIS connected') -ge 1) "'input
 $devLines = [regex]::Matches($trace, 'input: EIS device [^\r\n]*') | ForEach-Object { $_.Value }
 Assert "K2c-eis-devices" (@($devLines).Count -ge 1) "devices: $(if ($devLines) { ($devLines | Select-Object -Unique) -join '; ' } else { 'none (seat never bound)' })"
 Assert "K2d-eis-keymap" ((Count $trace 'input: guest keymap layout') -ge 1) "keyboard device delivered a keymap"
+# K10: Plasma 6.7's folder view dies on the containment move; plasmashell
+# only notices when the desktop is used, hence the probe's right-click.
+$restarts = Count $trace 'plasmashell restart done'
+if ($kwin67) {
+    Assert "K10a-shell-restarted" ($restarts -eq 1) "'plasmashell restart done' x$restarts (expected once on KWin >= 6.7)"
+} else {
+    Assert "K10a-no-shell-restart" ($restarts -eq 0) "'plasmashell restart done' x$restarts (KWin < 6.7 needs none)"
+}
+if ($RightClickSec -gt 0) {
+    # plasmashell logs to its owner's journal, which -GuestUser may not be.
+    $fvCmd = 'U=$(ps -o uid= -C plasmashell | head -1 | tr -d " "); if [ "$U" = "$(id -u)" ]; then J="journalctl --user"; else J="sudo -n journalctl _UID=$U"; fi; $J --no-pager -o cat --since @' + $mark.Epoch + ' 2>/dev/null | grep -c "FolderViewLayer.*of null"'
+    $fv = (Guest $fvCmd).Trim() -as [int]
+    Assert "K10b-folder-view-intact" ($fv -eq 0) "plasmashell FolderViewLayer null-model errors this session: $fv (right-click at ${RightClickSec}s)"
+}
 $teardown = Count $trace 'teardown: done'
 $layout1 = Layout
 $phys1 = EnabledPhysical $layout1
