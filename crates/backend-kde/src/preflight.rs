@@ -5,6 +5,7 @@
 //! transient ones (KWin not on the bus yet at login) exit normally so the
 //! unit's restart loop gets another go.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -56,6 +57,75 @@ fn on_path(tool: &str) -> bool {
     })
 }
 
+/// The Wayland global the kde backend needs a desktop-file grant for.
+pub const SCREENCAST_GLOBAL: &str = "zkde_screencast_unstable_v1";
+
+/// Whether a desktop file grants `exe` the screencast global, the way
+/// KWin's old check reads it: the first `Exec=` token, canonicalized, must
+/// equal the client's executable, and `X-KDE-Wayland-Interfaces` must list
+/// the global. `canon` resolves the Exec token (injected for tests).
+pub fn desktop_grants(text: &str, exe: &Path, canon: impl Fn(&Path) -> Option<PathBuf>) -> bool {
+    let mut exec = None;
+    let mut grants = false;
+    let mut in_entry = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_entry {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("Exec=") {
+            exec = v
+                .split_whitespace()
+                .next()
+                .map(|t| t.trim_matches(|c| c == '"' || c == '\'').to_owned());
+        } else if let Some(v) = line.strip_prefix("X-KDE-Wayland-Interfaces=") {
+            grants = v.split([',', ';']).any(|i| i.trim() == SCREENCAST_GLOBAL);
+        }
+    }
+    grants
+        && exec
+            .and_then(|e| canon(Path::new(&e)))
+            .is_some_and(|p| p == exe)
+}
+
+/// Search `$XDG_DATA_HOME` and `$XDG_DATA_DIRS` `applications/` for a grant.
+fn screencast_granted() -> bool {
+    let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|e| std::fs::canonicalize(e).ok())
+    else {
+        return true; // can't tell; don't warn
+    };
+    let home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    let dirs = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    let roots = home.into_iter().chain(dirs.split(':').map(PathBuf::from));
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root.join("applications")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "desktop") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if desktop_grants(&text, &exe, |p| std::fs::canonicalize(p).ok()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn kwin_version() -> Option<(u32, u32, u32)> {
     let out = Command::new("kwin_wayland")
         .arg("--version")
@@ -102,6 +172,16 @@ pub fn preflight() -> Result<(), Failure> {
         Some(v) => eprintln!("[backend-kde] preflight: KWin {}.{}.{}", v.0, v.1, v.2),
         None => eprintln!("[backend-kde] preflight: KWin version unknown; continuing"),
     }
+    if !screencast_granted() {
+        // Not fatal: upstream KWin only filters sandboxed clients, so the
+        // grant matters only on builds that kept the desktop-file check.
+        eprintln!(
+            "[backend-kde] preflight: no desktop file grants this binary \
+             zkde_screencast_unstable_v1 (X-KDE-Wayland-Interfaces); KWin builds that \
+             check it (Debian/Kali 6.7.4) will refuse the virtual output. Packages \
+             install /usr/share/applications/wayrdp.desktop for /usr/bin/wayrdp."
+        );
+    }
     // KWin claims its bus name a moment after WAYLAND_DISPLAY appears.
     let mut last = String::new();
     for _ in 0..10 {
@@ -131,6 +211,34 @@ mod tests {
         );
         assert_eq!(parse_kwin_version("kwin 6"), Some((6, 0, 0)));
         assert_eq!(parse_kwin_version("no version here"), None);
+    }
+
+    #[test]
+    fn desktop_file_grant_matching() {
+        let exe = Path::new("/usr/bin/wayrdp");
+        let id = |p: &Path| Some(p.to_path_buf());
+        let shipped = include_str!("../../../packaging/desktop/wayrdp.desktop");
+        assert!(desktop_grants(shipped, exe, id));
+        // A dev build elsewhere is not covered by the packaged file.
+        assert!(!desktop_grants(
+            shipped,
+            Path::new("/home/u/target/release/wayrdp"),
+            id
+        ));
+        let list = "[Desktop Entry]\nExec=\"/usr/bin/wayrdp\" --x\n\
+                    X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input,zkde_screencast_unstable_v1\n";
+        assert!(desktop_grants(list, exe, id));
+        let missing = "[Desktop Entry]\nExec=/usr/bin/wayrdp\n";
+        assert!(!desktop_grants(missing, exe, id));
+        let other_group = "[Desktop Entry]\nExec=/usr/bin/wayrdp\n\
+                           [Desktop Action x]\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1\n";
+        assert!(!desktop_grants(other_group, exe, id));
+        // A relative Exec never canonicalizes to the binary in KWin either.
+        let relative =
+            "[Desktop Entry]\nExec=wayrdp\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1\n";
+        assert!(!desktop_grants(relative, exe, |p| p
+            .is_absolute()
+            .then(|| p.to_path_buf())));
     }
 
     #[test]

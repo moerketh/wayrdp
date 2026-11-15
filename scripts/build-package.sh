@@ -107,6 +107,10 @@ stage_install_set() {  # $1 = destination root that receives usr/...
   install -Dm644 "$REPO_ROOT/packaging/systemd/wayrdp.service" \
       "$dest/usr/lib/systemd/user/wayrdp.service"
   install -Dm644 "$REPO_ROOT/LICENSE" "$dest/usr/share/licenses/wayrdp/LICENSE"
+  # KWin builds that gate restricted globals on X-KDE-Wayland-Interfaces
+  # (Debian/Kali 6.7.4) need this for the kde backend's screencast global.
+  install -Dm644 "$REPO_ROOT/packaging/desktop/wayrdp.desktop" \
+      "$dest/usr/share/applications/wayrdp.desktop"
   # Hyprland shm-capture plugin, SOURCE ONLY: Hyprland ships no stable C++
   # ABI, so the .so must be built on the guest against its own headers
   # (installers detect Hyprland + g++/headers and build or skip).
@@ -131,6 +135,8 @@ build_tarball() {
   install -Dm644 "$REPO_ROOT/packaging/systemd/wayrdp.service" \
       "$stage/$tar_root/lib/systemd/user/wayrdp.service"
   install -Dm644 "$REPO_ROOT/LICENSE" "$stage/$tar_root/share/doc/wayrdp/LICENSE"
+  install -Dm644 "$REPO_ROOT/packaging/desktop/wayrdp.desktop" \
+      "$stage/$tar_root/share/applications/wayrdp.desktop"
   install -Dm644 "$REPO_ROOT/plugins/hyprland-capture/main.cpp" \
       "$stage/$tar_root/share/wayrdp/plugins/hyprland-capture/main.cpp"
   install -Dm644 "$REPO_ROOT/plugins/hyprland-capture/Makefile" \
@@ -165,6 +171,13 @@ install -Dm644 "$TMP_UNIT" "$PREFIX/lib/systemd/user/wayrdp.service"
 rm -f "$TMP_UNIT"
 install -Dm644 "$SRC/share/doc/wayrdp/LICENSE" \
     "$PREFIX/share/doc/wayrdp/LICENSE"
+# KWin matches the desktop file's Exec against the running binary, so point
+# it at the real install location (same reason as ExecStart above).
+TMP_DESK="$(mktemp)"
+sed -E "s#^Exec=.*#Exec=$PREFIX/bin/wayrdp#" \
+    "$SRC/share/applications/wayrdp.desktop" > "$TMP_DESK"
+install -Dm644 "$TMP_DESK" "$PREFIX/share/applications/wayrdp.desktop"
+rm -f "$TMP_DESK"
 if [[ -d "$SRC/share/wayrdp/plugins" ]]; then
     # mkdir first: with $PREFIX/share/wayrdp absent, cp -r would create the
     # 'plugins' dir AS 'wayrdp' and drop the plugins/ level.

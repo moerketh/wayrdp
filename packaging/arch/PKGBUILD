@@ -80,6 +80,9 @@ package() {
     # systemd USER unit (started per-session; needs a live Wayland display)
     install -Dm644 "$root/packaging/systemd/wayrdp.service" \
         "$pkgdir/usr/lib/systemd/user/wayrdp.service"
+    # Desktop file: KWin's X-KDE-Wayland-Interfaces grant (kde backend)
+    install -Dm644 "$root/packaging/desktop/wayrdp.desktop" \
+        "$pkgdir/usr/share/applications/wayrdp.desktop"
     # License
     install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

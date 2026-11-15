@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=wayrdp
+Comment=Wayland-native RDP server
+Exec=/usr/bin/wayrdp
+NoDisplay=true
+Terminal=false
+# KWin before the sandbox-only filter (Debian/Kali 6.7.4 and older) only
+# announces restricted globals to a client whose executable has a desktop
+# file listing them. The kde backend needs the screencast global for its
+# virtual output. Exec must stay an absolute path: KWin matches it against
+# the client's canonical executable path.
+X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1

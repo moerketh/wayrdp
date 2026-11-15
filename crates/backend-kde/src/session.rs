@@ -129,6 +129,13 @@ async fn create(mgr: &VirtualOutputManager, size: Size) -> Option<u32> {
                     size.height,
                     attempt + 1
                 );
+                if format!("{e:#}").contains("zkde_screencast") {
+                    eprintln!(
+                        "[backend-kde] session: KWin did not offer zkde_screencast_unstable_v1; \
+                         on KWin builds that check X-KDE-Wayland-Interfaces the binary needs a \
+                         desktop file granting it (see packaging/desktop/wayrdp.desktop)"
+                    );
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
