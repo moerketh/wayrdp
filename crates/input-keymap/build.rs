@@ -1,4 +1,4 @@
-//! Mirrors freerdp-sys's `freerdp_present` cfg into backend-wlroots (F1:
+//! Mirrors freerdp-sys's `freerdp_present` cfg into input-keymap (F1:
 //! only with the WinPR tables present can we translate RDP scancodes to
 //! evdev keycodes properly).
 

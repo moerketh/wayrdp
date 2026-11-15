@@ -35,7 +35,7 @@ dependencies = [
  "clipboard-wayland",
  "crossbeam-channel",
  "desk-backend",
- "freerdp-sys",
+ "input-keymap",
  "libc",
  "memmap2",
  "serde_json",
@@ -226,6 +226,14 @@ dependencies = [
  "wayland-client",
  "wayland-protocols-plasma",
  "wayland-scanner",
+]
+
+[[package]]
+name = "input-keymap"
+version = "0.1.0"
+dependencies = [
+ "freerdp-sys",
+ "libc",
 ]
 
 [[package]]

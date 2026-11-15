@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/freerdp-sys",
     "crates/desk-backend",
+    "crates/input-keymap",
     "crates/rdp-core",
     "crates/backend-kde",
     "crates/backend-wlroots",

@@ -11,9 +11,9 @@ desk-backend = { path = "../desk-backend" }
 # Session clipboard (wlr-data-control); compositor-agnostic, shared with
 # any backend whose compositor implements the protocol.
 clipboard-wayland = { path = "../clipboard-wayland" }
-# RDP scancode → evdev keycode via WinPR's VK tables (F1). On non-freerdp
-# builds this crate compiles a stub and the legacy -8 map is used.
-freerdp-sys = { path = "../freerdp-sys" }
+# RDP scancode → evdev keycode via WinPR's VK tables (F1), modifier bits and
+# monotonic stamps; shared with backend-kde.
+input-keymap = { path = "../input-keymap" }
 # Same wayland-client line as hyperv-rdp-extras to keep one version
 # in one lockfile. backend-wlroots self-binds (no extras dep) so it stays
 # compositor-agnostic (Hyprland AND Sway), not KWin-specific.
