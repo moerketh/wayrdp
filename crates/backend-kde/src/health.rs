@@ -51,6 +51,25 @@ pub enum Uniform {
     Solid,
 }
 
+/// Health sample attached to a delivered frame. Only some frames are
+/// sampled (all inside the connect window, ~1/s after), and an unsampled
+/// frame must not read as "real content": that would reset the uniform
+/// streak between samples and a blank desktop would never be healed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sample {
+    /// Not inspected; proves only that the stream is alive.
+    Skipped,
+    /// Inspected and not uniform: a rendered desktop.
+    Content,
+    Uniform(Uniform),
+}
+
+impl Sample {
+    pub fn of(uniform: Option<Uniform>) -> Self {
+        uniform.map_or(Sample::Content, Sample::Uniform)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observation {
     /// The capture stream was (re)connected: session start, recreate, or an
@@ -61,7 +80,7 @@ pub enum Observation {
     /// "empty secondary screen" of the first second and never count.
     LayoutSettled(Instant),
     Frame {
-        uniform: Option<Uniform>,
+        sample: Sample,
         at: Instant,
     },
     /// The client injected input (so a solid colour may be user content).
@@ -143,13 +162,14 @@ impl Health {
                 self.settled_at = Some(at);
                 Action::None
             }
-            Observation::Frame { uniform, at } => {
+            Observation::Frame { sample, at } => {
                 self.got_frame = true;
                 // A frame proves the stream works; a later no-frame stall gets
                 // its own recreate again.
                 self.no_frame_recreated = false;
-                match uniform {
-                    None => {
+                match sample {
+                    Sample::Skipped => {}
+                    Sample::Content => {
                         self.uniform_since = None;
                         // A real frame means the layout healed (or never
                         // broke): reset the ladder, but escalation stays
@@ -158,7 +178,7 @@ impl Health {
                             self.stage = Stage::Watching;
                         }
                     }
-                    Some(kind) => {
+                    Sample::Uniform(kind) => {
                         if self.settled_at.is_some_and(|s| at >= s) {
                             match self.uniform_since {
                                 Some((t, _)) => self.uniform_since = Some((t, kind)),
@@ -300,7 +320,7 @@ mod tests {
         h.observe(Observation::Connected(t));
         h.observe(Observation::LayoutSettled(t + s(500)));
         h.observe(Observation::Frame {
-            uniform: Some(kind),
+            sample: Sample::Uniform(kind),
             at: t + s(600),
         });
     }
@@ -329,7 +349,7 @@ mod tests {
         h.observe(Observation::Connected(t));
         h.observe(Observation::LayoutSettled(t + s(500)));
         h.observe(Observation::Frame {
-            uniform: None,
+            sample: Sample::Content,
             at: t + s(600),
         });
         for secs in [5, 30, 120, 600] {
@@ -340,6 +360,34 @@ mod tests {
         }
     }
 
+    /// Regression: capture samples ~1/s after the connect window, and the
+    /// unsampled frames in between used to arrive as "content", resetting
+    /// the streak, so a blank desktop was never healed.
+    #[test]
+    fn unsampled_frames_do_not_break_a_uniform_streak() {
+        let mut h = Health::new();
+        let t = t0();
+        uniform_session(&mut h, t, Uniform::Solid);
+        let mut healed = false;
+        for ms in (650..6_000).step_by(50) {
+            h.observe(Observation::Frame {
+                sample: Sample::Skipped,
+                at: t + s(ms),
+            });
+            if ms % 1_000 == 0 {
+                h.observe(Observation::Frame {
+                    sample: Sample::Uniform(Uniform::Solid),
+                    at: t + s(ms),
+                });
+            }
+            if let Action::Heal { .. } = h.observe(Observation::Tick(t + s(ms))) {
+                healed = true;
+                break;
+            }
+        }
+        assert!(healed, "a blank desktop must heal despite unsampled frames");
+    }
+
     #[test]
     fn a_short_uniform_blip_never_heals() {
         let mut h = Health::new();
@@ -347,7 +395,7 @@ mod tests {
         uniform_session(&mut h, t, Uniform::Solid);
         assert_eq!(h.observe(Observation::Tick(t + s(3_000))), Action::None);
         h.observe(Observation::Frame {
-            uniform: None,
+            sample: Sample::Content,
             at: t + s(3_500),
         });
         assert_eq!(h.observe(Observation::Tick(t + s(10_000))), Action::None);
@@ -359,7 +407,7 @@ mod tests {
         let t = t0();
         h.observe(Observation::Connected(t));
         h.observe(Observation::Frame {
-            uniform: Some(Uniform::Unrendered),
+            sample: Sample::Uniform(Uniform::Unrendered),
             at: t + s(100),
         });
         assert_eq!(h.observe(Observation::Tick(t + s(6_000))), Action::None);
@@ -398,7 +446,7 @@ mod tests {
             Action::Heal { escalate: false }
         );
         h.observe(Observation::Frame {
-            uniform: None,
+            sample: Sample::Content,
             at: t + s(6_000),
         });
         assert_eq!(h.observe(Observation::Tick(t + s(20_000))), Action::None);
@@ -451,11 +499,11 @@ mod tests {
         h.observe(Observation::Connected(t));
         h.observe(Observation::LayoutSettled(t + s(500)));
         h.observe(Observation::Frame {
-            uniform: None,
+            sample: Sample::Content,
             at: t + s(600),
         });
         h.observe(Observation::Frame {
-            uniform: Some(Uniform::Solid),
+            sample: Sample::Uniform(Uniform::Solid),
             at: t + s(30_000),
         });
         assert_eq!(h.observe(Observation::Tick(t + s(40_000))), Action::None);

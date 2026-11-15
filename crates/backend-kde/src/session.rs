@@ -25,7 +25,7 @@ use hyperv_rdp_extras::session::{
 use tokio::sync::{mpsc::UnboundedReceiver, Notify};
 
 use crate::capture::{self, Command, CommandTx};
-use crate::health::{Action, Health, Observation};
+use crate::health::{Action, Health, Observation, Sample};
 use crate::input::Input;
 use crate::recovery::KSCREEN_NAME;
 use crate::resize::{sanitize, Coalescer};
@@ -284,6 +284,8 @@ async fn session(s: Session) {
 
     let mut tick = tokio::time::interval(TICK);
     let mut input_noted = false;
+    let mut first_frame = true;
+    let mut last_sample: Option<Sample> = None;
     loop {
         let due = live.coalescer.deadline();
         tokio::select! {
@@ -298,8 +300,20 @@ async fn session(s: Session) {
             }
             ev = capture_events.recv() => {
                 let action = match ev {
-                    Some(capture::Event::Frame { uniform, at }) => {
-                        live.health.observe(Observation::Frame { uniform, at })
+                    Some(capture::Event::Frame { sample, at }) => {
+                        if first_frame {
+                            first_frame = false;
+                            eprintln!(
+                                "[backend-kde] capture: first frame {} ms after create",
+                                at.saturating_duration_since(started).as_millis()
+                            );
+                        }
+                        // Transitions only (harness A7 greps "desktop content").
+                        if sample != Sample::Skipped && Some(sample) != last_sample {
+                            last_sample = Some(sample);
+                            eprintln!("[backend-kde] health: desktop content {sample:?}");
+                        }
+                        live.health.observe(Observation::Frame { sample, at })
                     }
                     Some(capture::Event::StreamLost(at)) => {
                         live.health.observe(Observation::StreamLost(at))

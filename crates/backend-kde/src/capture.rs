@@ -33,7 +33,7 @@ use pw::spa::pod::{
 };
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
 
-use crate::health::{sample_uniform, Uniform, CONNECT_WINDOW};
+use crate::health::{sample_uniform, Sample, CONNECT_WINDOW};
 
 pub enum Command {
     /// (Re)connect to this zkde node, dropping any current stream.
@@ -44,12 +44,9 @@ pub enum Command {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    /// A frame was delivered; `uniform` is the health sample (only computed
+    /// A frame was delivered; `sample` is the health sample (only computed
     /// often inside the connect window, ~1/s after).
-    Frame {
-        uniform: Option<Uniform>,
-        at: Instant,
-    },
+    Frame { sample: Sample, at: Instant },
     /// The stream died while we expected it to stream.
     StreamLost(Instant),
 }
@@ -480,10 +477,10 @@ fn process(stream: &pw::stream::Stream, d: &mut StreamData) {
     let t = Instant::now();
     let pixels: Box<[u8]> = src.into();
     d.stats.copy_us += t.elapsed().as_micros() as u64;
-    let uniform = if d.wants_sample(now) {
-        sample_uniform(&pixels, width, height, stride)
+    let sample = if d.wants_sample(now) {
+        Sample::of(sample_uniform(&pixels, width, height, stride))
     } else {
-        None
+        Sample::Skipped
     };
     let damage = clip_damage(&regions, width, height);
     d.stats.frames += 1;
@@ -506,7 +503,7 @@ fn process(stream: &pw::stream::Stream, d: &mut StreamData) {
     if let Some(w) = &d.wake {
         w();
     }
-    let _ = d.events.send(Event::Frame { uniform, at: now });
+    let _ = d.events.send(Event::Frame { sample, at: now });
     d.log_stats(now);
 }
 
