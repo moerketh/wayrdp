@@ -1513,8 +1513,8 @@ noop_dispatch!(wayland_protocols::ext::image_capture_source::v1::client::ext_ima
 ///
 /// Hyprland only renders on damage, so a higher rate costs nothing at idle
 /// but halves the render-tick wait during motion (16.7 ms @60 → 8.3 ms
-/// @120). Default 60; override with WAYRDP_OUTPUT_HZ (clamped to 30..240;
-/// invalid values fall back). Shared by create_headless_output and
+/// @120). Default 60; override with WAYRDP_OUTPUT_HZ (30..=240; unparsable or
+/// out-of-range values fall back to 60). Shared by create_headless_output and
 /// repin_output_mode so a re-applied mode keeps the same rate instead of
 /// silently dropping back to 60.
 fn output_hz() -> u32 {

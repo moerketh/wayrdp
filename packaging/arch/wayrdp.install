@@ -14,8 +14,9 @@ post_install() {
         systemctl --user enable --now wayrdp.service
     To have it survive logout (RDP before the local session logs in):
         sudo loginctl enable-linger <user>
-    The default WAYRDP_BACKEND=wlroots requires hyprctl on PATH (Hyprland);
-    edit the unit's Environment to select kde or synthetic instead.
+    The backend auto-selects from XDG_CURRENT_DESKTOP; Hyprland needs hyprctl
+    on PATH. KDE/Plasma and Sway have no working backend yet. Set
+    WAYRDP_BACKEND=synthetic in the unit's Environment for the test pattern.
 MSG
 }
 

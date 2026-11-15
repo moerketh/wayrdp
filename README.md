@@ -17,6 +17,8 @@ MIT licensed, built on FreeRDP 3 (`libfreerdp-server3`, Apache-2.0).
   size, Display-Control live resize, RemoteFX-over-EGFX frames (tiling
   diffs opt-in via `WAYRDP_TILED_DIFF`), client-layout-matched xkb
   keymap, client desktop-scale mirroring, virtual pointer/keyboard input.
+* Clipboard redirection (text and files, both directions) over
+  `zwlr_data_control_v1`.
 * Stability hardened against real vmconnect churn: peer teardown
   ordering, client-EOF and pre-activation watchdogs, EGFX back-pressure
   that survives clients which suspend frame acks, timed `hyprctl` calls,
@@ -41,8 +43,9 @@ MIT licensed, built on FreeRDP 3 (`libfreerdp-server3`, Apache-2.0).
 |---|---|
 | `crates/freerdp-sys` | bindgen + C shim over freerdp-server3 (build-time generated) |
 | `crates/desk-backend` | the compositor-agnostic backend trait — zero Wayland deps |
-| `crates/rdp-core` | safe-Rust RDP server core (listener, peer, EGFX/RemoteFX, dispctrl, input, vsock) |
+| `crates/rdp-core` | safe-Rust RDP server core (listener, peer, EGFX/RemoteFX, dispctrl, cliprdr, input, vsock) |
 | `crates/backend-wlroots` | Hyprland: headless output + capture (ext-image-copy-capture or shm-plugin) + virtual pointer/keyboard |
+| `crates/clipboard-wayland` | session clipboard over `zwlr_data_control_v1`, compositor-agnostic |
 | `crates/backend-kde` | Plasma virtual-output adapter (stub; ships with hyperv-rdp-extras wiring) |
 | `server` | the `wayrdp` binary |
 | `plugins/hyprland-capture` | Hyprland C++ capture plugin for the shm path (built on the guest) |
@@ -50,9 +53,9 @@ MIT licensed, built on FreeRDP 3 (`libfreerdp-server3`, Apache-2.0).
 | `scripts/` | release packaging, vsock send-path tracing |
 | `packaging/` | systemd user unit, Arch PKGBUILD |
 
-Unit tests are deliberately few (synthetic frames and vsock lifetimes in
-`rdp-core`, backend selection in `server`); real validation is the harness
-plus manual client checks (see [Validating](#validating)).
+Unit tests cover pure logic only (clipboard formats, pointer PDUs, keymaps,
+backend selection and the like); real validation is the harness plus manual
+client checks (see [Validating](#validating)).
 
 ## Run
 
@@ -61,8 +64,9 @@ KDE/Plasma and Sway are startup errors (exit 42 — a restart can't fix
 "no backend", so the systemd unit's `RestartPreventExitStatus` stops the
 retry loop) rather than silently serving the synthetic test desktop on a
 real session. An unrecognized or unset desktop falls back to `synthetic`
-with a warning; override explicitly with `WAYRDP_BACKEND=wlroots|synthetic`
-(`kde` is still a stub).
+with a warning; override explicitly with `WAYRDP_BACKEND=wlroots|synthetic`.
+Any other value, including `kde` (still a stub), is also an exit-42 startup
+error.
 
 On Hyprland, capture runs either over `ext-image-copy-capture-v1`
 (default) or via the `hyprland-capture` plugin (`WAYRDP_CAPTURE=shm-plugin`)

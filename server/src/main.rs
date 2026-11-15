@@ -129,26 +129,14 @@ enum Backend {
 /// drives Hyprland (`hyprctl`), so serving `synthetic` there would show a
 /// vmconnect user the test pattern instead of telling them nothing works.
 /// `WAYRDP_BACKEND=synthetic` is the explicit escape hatch. Explicitly asking
-/// for `kde` is a startup error, not a per-connection surprise.
+/// for `kde`, or for a backend that doesn't exist (a typo), is a startup error,
+/// not a per-connection surprise or a silent test pattern.
 fn selected_backend() -> anyhow::Result<Backend> {
     let explicit = std::env::var("WAYRDP_BACKEND")
         .ok()
         .filter(|s| !s.is_empty());
     if let Some(v) = explicit {
-        return Ok(match v.as_str() {
-            "wlroots" => Backend::Wlroots,
-            "kde" => {
-                return Err(selected_backend::EXIT_NO_BACKEND.apply(anyhow::anyhow!(
-                    "WAYRDP_BACKEND=kde: the KDE backend is not implemented \
-                     (its `open` returns Unsupported); use wlroots or synthetic"
-                )))
-            }
-            "synthetic" => Backend::Synthetic,
-            other => {
-                eprintln!("[wayrdp] unknown WAYRDP_BACKEND={other:?}; using synthetic");
-                Backend::Synthetic
-            }
-        });
+        return explicit_backend(&v);
     }
     let desktops = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     for tag in desktops.split(':').map(str::trim) {
@@ -172,6 +160,21 @@ fn selected_backend() -> anyhow::Result<Backend> {
          serving the synthetic test backend (set WAYRDP_BACKEND to override)"
     );
     Ok(Backend::Synthetic)
+}
+
+/// Resolve a non-empty `WAYRDP_BACKEND` value.
+fn explicit_backend(value: &str) -> anyhow::Result<Backend> {
+    match value {
+        "wlroots" => Ok(Backend::Wlroots),
+        "synthetic" => Ok(Backend::Synthetic),
+        "kde" => Err(selected_backend::EXIT_NO_BACKEND.apply(anyhow::anyhow!(
+            "WAYRDP_BACKEND=kde: the KDE backend is not implemented \
+             (its `open` returns Unsupported); use wlroots or synthetic"
+        ))),
+        other => Err(selected_backend::EXIT_NO_BACKEND.apply(anyhow::anyhow!(
+            "unknown WAYRDP_BACKEND={other:?}; use wlroots or synthetic"
+        ))),
+    }
 }
 
 /// `$XDG_DATA_HOME/wayrdp` (or `~/.local/share/wayrdp`): TLS cert/key and
@@ -318,4 +321,32 @@ fn sam_line_usable(line: &str) -> bool {
         && !f[0].is_empty()
         && f[3].len() == 32
         && f[3].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_backend_values_resolve() {
+        assert!(matches!(explicit_backend("wlroots"), Ok(Backend::Wlroots)));
+        assert!(matches!(
+            explicit_backend("synthetic"),
+            Ok(Backend::Synthetic)
+        ));
+    }
+
+    #[test]
+    fn kde_and_typos_exit_with_no_backend_status() {
+        for value in ["kde", "wlroot", "Wlroots"] {
+            let Err(e) = explicit_backend(value) else {
+                panic!("{value} must not select a backend");
+            };
+            assert_eq!(
+                selected_backend::exit_code(&e),
+                selected_backend::EXIT_NO_BACKEND,
+                "{value}"
+            );
+        }
+    }
 }
