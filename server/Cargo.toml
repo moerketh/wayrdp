@@ -12,3 +12,6 @@ rdp-core = { path = "../crates/rdp-core" }
 backend-wlroots = { path = "../crates/backend-wlroots" }
 backend-kde = { path = "../crates/backend-kde" }
 anyhow = "1"
+# Library logs (hyperv-rdp-extras logs via `tracing`): without a subscriber
+# they are silently dropped.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }

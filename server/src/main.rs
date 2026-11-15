@@ -26,6 +26,7 @@ mod selected_backend;
 use selected_backend::TaggedError;
 
 fn main() -> anyhow::Result<()> {
+    init_tracing();
     let tcp = tcp_enabled();
     let vsock = !matches!(
         std::env::var("WAYRDP_VSOCK").as_deref(),
@@ -160,6 +161,36 @@ fn selected_backend() -> anyhow::Result<Backend> {
          serving the synthetic test backend (set WAYRDP_BACKEND to override)"
     );
     Ok(Backend::Synthetic)
+}
+
+/// stderr sink for `tracing` that swallows write errors. A full /tmp (the
+/// unit's stderr can be a file there) must not turn a log line into a panic
+/// inside a FreeRDP callback: see the 2026-10-13 stderr-panic note.
+struct QuietStderr;
+
+impl std::io::Write for QuietStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write_all(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stderr().flush();
+        Ok(())
+    }
+}
+
+/// Route library `tracing` events (hyperv-rdp-extras) to stderr, filtered by
+/// `RUST_LOG` (default `info`). No timestamps or ANSI: the journal adds the
+/// former, and escape codes break log greps.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(|| QuietStderr)
+        .with_ansi(false)
+        .without_time()
+        .try_init();
 }
 
 /// Resolve a non-empty `WAYRDP_BACKEND` value.
