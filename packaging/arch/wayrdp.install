@@ -15,8 +15,9 @@ post_install() {
     To have it survive logout (RDP before the local session logs in):
         sudo loginctl enable-linger <user>
     The backend auto-selects from XDG_CURRENT_DESKTOP; Hyprland needs hyprctl
-    on PATH. KDE/Plasma and Sway have no working backend yet. Set
-    WAYRDP_BACKEND=synthetic in the unit's Environment for the test pattern.
+    on PATH, KDE needs Plasma 6.3+ with kscreen and glib2 (gdbus). Sway has
+    no working backend. Set WAYRDP_BACKEND=synthetic in the unit's
+    Environment for the test pattern.
 MSG
 }
 

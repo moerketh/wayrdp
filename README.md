@@ -45,8 +45,8 @@ MIT licensed, built on FreeRDP 3 (`libfreerdp-server3`, Apache-2.0).
 | `crates/desk-backend` | the compositor-agnostic backend trait — zero Wayland deps |
 | `crates/rdp-core` | safe-Rust RDP server core (listener, peer, EGFX/RemoteFX, dispctrl, cliprdr, input, vsock) |
 | `crates/backend-wlroots` | Hyprland: headless output + capture (ext-image-copy-capture or shm-plugin) + virtual pointer/keyboard |
-| `crates/clipboard-wayland` | session clipboard over `zwlr_data_control_v1`, compositor-agnostic |
-| `crates/backend-kde` | Plasma virtual-output adapter (stub; ships with hyperv-rdp-extras wiring) |
+| `crates/clipboard-wayland` | session clipboard over `ext_data_control_v1` (`zwlr_data_control_v1` fallback), compositor-agnostic |
+| `crates/backend-kde` | Plasma 6.3+: KWin virtual output via hyperv-rdp-extras, PipeWire SHM capture, EIS input |
 | `server` | the `wayrdp` binary |
 | `plugins/hyprland-capture` | Hyprland C++ capture plugin for the shm path (built on the guest) |
 | `tools/` | VMConnect host-side regression harness + prober, compositor stress, hvsocket forwarder |
@@ -59,14 +59,27 @@ client checks (see [Validating](#validating)).
 
 ## Run
 
-Backend auto-selects from `XDG_CURRENT_DESKTOP`: Hyprland → `wlroots`.
-KDE/Plasma and Sway are startup errors (exit 42 — a restart can't fix
+Backend auto-selects from `XDG_CURRENT_DESKTOP`: Hyprland → `wlroots`,
+KDE → `kde`. Sway is a startup error (exit 42 — a restart can't fix
 "no backend", so the systemd unit's `RestartPreventExitStatus` stops the
 retry loop) rather than silently serving the synthetic test desktop on a
 real session. An unrecognized or unset desktop falls back to `synthetic`
-with a warning; override explicitly with `WAYRDP_BACKEND=wlroots|synthetic`.
-Any other value, including `kde` (still a stub), is also an exit-42 startup
-error.
+with a warning; override explicitly with
+`WAYRDP_BACKEND=wlroots|kde|synthetic`. Any other value is also an exit-42
+startup error.
+
+The KDE backend needs Plasma/KWin 6.3 or newer (validated on Kali's 6.7 and
+Parrot's 6.3) plus `kscreen-doctor`, `gdbus` and `pkill`; a missing tool or
+an older KWin exits 42 at startup. Each connection gets its own KWin virtual
+output at the client size; physical outputs are switched off for the
+session and restored on disconnect, and also at the next start if a crash
+left them off (`WAYRDP_KDE_RESTORE_ON_START=0` disables that). Frames come
+over PipeWire as shared memory (DmaBuf is never negotiated, which matters
+on Hyper-V's software GL), and input goes through KWin's EIS endpoint with
+no consent prompt. Keys follow the guest's KWin keyboard layout, not the
+client's, so set the guest layout to match. The lock screen is not
+handled yet: disable it (`kwriteconfig6 --file kscreenlockerrc --group
+Daemon --key Autolock false`) on guests you reach over RDP.
 
 On Hyprland, capture runs either over `ext-image-copy-capture-v1`
 (default) or via the `hyprland-capture` plugin (`WAYRDP_CAPTURE=shm-plugin`)

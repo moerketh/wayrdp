@@ -28,7 +28,8 @@ jobs:
             libclang-dev \
             pkg-config \
             libwayland-dev \
-            libxkbcommon-dev
+            libxkbcommon-dev \
+            libpipewire-0.3-dev
 
       - name: Verify tag matches Cargo version
         run: |

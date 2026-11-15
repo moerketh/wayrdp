@@ -4,21 +4,26 @@ Documentation=https://github.com/moerketh/wayrdp
 
 # wayrdp talks to the live compositor over the user's Wayland socket. The
 # wlroots backend drives Hyprland via `hyprctl output create headless`
-# (+ ext-image-copy-capture + virtual-keyboard input), so it must start only
-# inside a graphical session that has a Wayland display.
-After=graphical-session.target
+# (+ ext-image-copy-capture + virtual-keyboard input); the kde backend
+# streams a KWin virtual output over PipeWire and injects input via EIS. So
+# it must start only inside a graphical session that has a Wayland display.
+# plasma-workspace.target orders it after KWin and plasmashell on Plasma
+# (ignored elsewhere: After= on a unit that never starts is a no-op).
+After=graphical-session.target plasma-workspace.target pipewire.service
 Wants=graphical-session.target
 ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=simple
 # WAYRDP_BACKEND selects the capture/input path at runtime:
-#   wlroots   — Hyprland headless output + ext-image-copy-capture (primary)
+#   wlroots   — Hyprland headless output + ext-image-copy-capture
+#   kde       — Plasma 6.3+ KWin virtual output (PipeWire SHM) + EIS input
 #   synthetic — test pattern (no compositor; for CI and debugging)
-# (unset)   — auto-detect from XDG_CURRENT_DESKTOP; KDE/Plasma and Sway
-#             have no working backend yet and wayrdp refuses to start
-#             there (exit status 42) unless the test backend is forced.
-# Any other value, including kde, also exits with status 42.
+# (unset)   — auto-detect from XDG_CURRENT_DESKTOP; Sway has no working
+#             backend and wayrdp refuses to start there (exit status 42)
+#             unless the test backend is forced. Plasma older than 6.3 or a
+#             missing kscreen-doctor/gdbus/pkill also exits with status 42.
+# Any other value also exits with status 42.
 Environment=RUST_LOG=info
 ExecStart=/usr/bin/wayrdp
 Restart=on-failure

@@ -2,14 +2,15 @@
 pkgname=wayrdp
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Wayland-native RDP server on FreeRDP 3 with compositor-specific backends (Hyprland/Sway wlroots, KDE)"
+pkgdesc="Wayland-native RDP server on FreeRDP 3 with compositor-specific backends (Hyprland, KDE Plasma 6.3+)"
 arch=('x86_64')
 url="https://github.com/moerketh/wayrdp"
 license=('MIT')
 # Runtime: FreeRDP 3 server/client (libfreerdp-server3 / libwinpr3), the
 # openssl CLI for the ephemeral self-signed TLS cert, libxkbcommon via the
-# Wayland client libs, and hyprctl (hyprland) for the wlroots backend's
-# headless-output management.
+# Wayland client libs, libpipewire (KDE backend capture; always linked),
+# hyprctl (hyprland) for the wlroots backend's headless-output management,
+# and kscreen-doctor/gdbus/pkill for the KDE backend.
 depends=(
     'gcc-libs'
     'glibc'
@@ -17,10 +18,13 @@ depends=(
     'openssl'
     'wayland'
     'libxkbcommon'
+    'libpipewire'
 )
 optdepends=(
     'hyprland: wlroots backend (headless output + ext-image-copy-capture)'
-    'sway: wlroots backend (zwlr headless variant)'
+    'kwin: kde backend (Plasma 6.3+ virtual output + EIS input)'
+    'kscreen: kde backend output management (kscreen-doctor)'
+    'glib2: kde backend (gdbus)'
 )
 makedepends=(
     'cargo'

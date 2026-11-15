@@ -203,14 +203,16 @@ Section: net
 Priority: optional
 Architecture: amd64
 Maintainer: moerketh <https://github.com/moerketh>
-Depends: libc6, libwayland-client0, libxkbcommon0, openssl, libfreerdp-server3-3, libfreerdp3-3, libwinpr3-3
+Depends: libc6, libwayland-client0, libxkbcommon0, libpipewire-0.3-0t64 | libpipewire-0.3-0, openssl, libfreerdp-server3-3, libfreerdp3-3, libwinpr3-3
+Suggests: kscreen, libglib2.0-bin, procps
 Description: Wayland-native RDP server on FreeRDP 3
  wayrdp is a Wayland-native RDP server built on the FreeRDP 3
  (libfreerdp-server) core with compositor-specific capture/input backends:
- a wlroots backend (Hyprland headless output + ext-image-copy-capture and
- Sway) and a KDE KWin virtual-output backend, selected at runtime via
- WAYRDP_BACKEND. Runs as a systemd user unit inside the live Wayland
- session.
+ a wlroots backend (Hyprland headless output + ext-image-copy-capture) and
+ a KDE Plasma 6.3+ backend (KWin virtual output over PipeWire, libei
+ input), selected from XDG_CURRENT_DESKTOP or WAYRDP_BACKEND. The KDE
+ backend needs kscreen-doctor, gdbus and pkill at runtime. Runs as a
+ systemd user unit inside the live Wayland session.
 EOF
 
   cat > "$stage/DEBIAN/postinst" <<'EOF'
