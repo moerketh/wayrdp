@@ -27,7 +27,10 @@
 #   K10 folder view   - a desktop right-click during the hold logs no
 #                       FolderViewLayer error from plasmashell (Plasma 6.7
 #                       breaks the folder view on the screen swap; wayrdp
-#                       restarts plasmashell once on KWin >= 6.7)
+#                       restarts plasmashell once on KWin >= 6.7). Caveat:
+#                       the probe has not reproduced the breakage itself
+#                       (only a real vmconnect session did), so K10b guards
+#                       the click path, not the original bug
 #   K7  teardown      - "teardown: done"; Virtual-wayrdp gone and the
 #                       baseline physical outputs enabled again
 #   K8  churn         - 6 rapid 2 s connects; afterwards the same KWin pid,

@@ -41,6 +41,20 @@ public class VmConnectProbe {
     [DllImport("ws2_32.dll")] static extern int send(IntPtr s, byte[] buf, int len, int flags);
     [DllImport("ws2_32.dll")] static extern int recv(IntPtr s, byte[] buf, int len, int flags);
     [DllImport("ws2_32.dll")] static extern int shutdown(IntPtr s, int how);
+    [StructLayout(LayoutKind.Sequential)] struct WSAPOLLFD { public IntPtr fd; public short events; public short revents; }
+    [DllImport("ws2_32.dll")] static extern int WSAPoll([In, Out] WSAPOLLFD[] fds, uint nfds, int timeout);
+    // recv only after poll says readable: AF_HYPERV ignores SO_RCVTIMEO, so
+    // a plain blocking recv on an idle session (a KDE desktop sends no
+    // frames while nothing changes) overran every hold deadline and timed
+    // steps such as --right-click never ran. -1 + WSAETIMEDOUT-like 10060.
+    static int RecvWait(IntPtr s, byte[] buf, int timeoutMs) {
+        var fds = new[] { new WSAPOLLFD { fd = s, events = 0x0100 /* POLLRDNORM */ } };
+        int r = WSAPoll(fds, 1, Math.Max(0, timeoutMs));
+        if (r == 0) { s_lastRecvTimedOut = true; return -1; }
+        s_lastRecvTimedOut = false;
+        return recv(s, buf, buf.Length, 0);
+    }
+    static bool s_lastRecvTimedOut;
     [DllImport("ws2_32.dll", SetLastError=true)] static extern int WSAGetLastError();
     [DllImport("ws2_32.dll", SetLastError=true)] static extern int WSAStartup(ushort wVersionRequested, IntPtr lpWSAData);
 
@@ -180,8 +194,8 @@ public class VmConnectProbe {
         // version=RDP 5 (0x0A) keeps EGFX-capable paths available.
         var core = new byte[216];
         core[0] = 0x0a; core[1] = 0x00; core[2] = 0x08; core[3] = 0x00; // version RDP5
-        core[4] = 0x20; core[5] = 0x03;              // desktopWidth 800
-        core[6] = 0x58; core[7] = 0x02;              // desktopHeight 600
+        core[4] = (byte)desktopW; core[5] = (byte)(desktopW >> 8);  // desktopWidth (--size, default 800)
+        core[6] = (byte)desktopH; core[7] = (byte)(desktopH >> 8);  // desktopHeight (default 600)
         core[8] = 0x01; core[9] = 0xca;              // colorDepth 0xca01
         core[10] = 0xaa; core[11] = 0x03;            // sasSequence
         core[12] = 0x09; core[13] = 0x04;            // keyboardLayout en-US
@@ -339,9 +353,10 @@ public class VmConnectProbe {
         byte[] Fill(int need, int timeoutMs) {
             int deadline = Environment.TickCount + timeoutMs; var tmp = new byte[8192];
             while (backlog.Count < need && Environment.TickCount < deadline) {
-                int n = recv(s, tmp, tmp.Length, 0);
+                int n = RecvWait(s, tmp, deadline - Environment.TickCount);
                 if (n > 0) { for (int i = 0; i < n; i++) backlog.Add(tmp[i]); }
                 else if (n == 0) return null;
+                else if (s_lastRecvTimedOut) break;
                 else { int e = WSAGetLastError(); if (e != 10035 && e != 10060) return null; Thread.Sleep(5); }
             }
             if (backlog.Count < need) return null;
@@ -373,13 +388,17 @@ public class VmConnectProbe {
     }
 
     public static int Main(string[] args) {
-        if (args.Length < 2) { Console.WriteLine("usage: vmconnect-probe <vmGuid> <serviceGuid> [--seconds N] [--send-input] [--neg-ssl] [--right-click SECS] [--die-at-stage N]"); return 2; }
+        if (args.Length < 2) { Console.WriteLine("usage: vmconnect-probe <vmGuid> <serviceGuid> [--seconds N] [--send-input] [--neg-ssl] [--right-click SECS] [--size WxH] [--die-at-stage N]"); return 2; }
         int settleSec = 2;
         for (int i = 2; i < args.Length; i++) {
             if (args[i] == "--seconds" && i + 1 < args.Length) settleSec = int.Parse(args[++i]);
             else if (args[i] == "--send-input") sendInput = true;
             else if (args[i] == "--neg-ssl") negSsl = true;
             else if (args[i] == "--right-click" && i + 1 < args.Length) rightClickAfter = int.Parse(args[++i]);
+            else if (args[i] == "--size" && i + 1 < args.Length) {
+                var wh = args[++i].Split('x');
+                desktopW = int.Parse(wh[0]); desktopH = int.Parse(wh[1]);
+            }
             else if (args[i] == "--die-at-stage" && i + 1 < args.Length) dieAtStage = int.Parse(args[++i]);
         }
         Guid vmId = new Guid(args[0]);
@@ -587,7 +606,7 @@ public class VmConnectProbe {
                     rightClicked = true;
                     try {
                         SendRightClick(s, userId, shareId, 400, 250);
-                        Thread.Sleep(1500);
+                        Thread.Sleep(3000);  // menu stays up long enough to screenshot
                         SendScancodeKey(s, userId, shareId, 0x01);  // Escape
                         Console.WriteLine("[probe] input sent: right-click at 400,250 then Escape");
                     } catch (Exception iex) {
@@ -604,6 +623,9 @@ public class VmConnectProbe {
                         " len=" + hp.Length + " head=" + head);
                 }
             }
+            if (!rightClicked)
+                Console.WriteLine("[probe] WARN right-click not sent: hold ended after " +
+                    (Environment.TickCount - holdStart) + " ms");
             // Wayrdp re-queues the drdynvc capability request while
             // DRDYNVC_STATE_INITIALIZED (throttled ~1.9s). If the hold above
             // closed just before a retry landed, the gate below can miss a
@@ -805,6 +827,7 @@ public class VmConnectProbe {
     static int s_rdpgfxChanId = -1;
     static bool sendInput = false;
     static int rightClickAfter = 0;
+    static int desktopW = 800, desktopH = 600;
 
     // Input burst on the slow path (Share Control, pduType2=0x1C = Input).
     // TS_INPUT_PDU_DATA (MS-RDPBCGR 2.2.8.1.1.3.1) as ACTUALLY parsed by
