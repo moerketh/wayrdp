@@ -60,7 +60,7 @@ function Assert($name, [bool]$ok, $detail) {
 }
 
 # Session environment for tools that talk to KWin/D-Bus from an ssh shell.
-$SessionEnv = 'export XDG_RUNTIME_DIR=/run/user/$(id -u); export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; export WAYLAND_DISPLAY=$(ls $XDG_RUNTIME_DIR 2>/dev/null | grep -E "^wayland-[0-9]+$" | head -1); export QT_QPA_PLATFORM=wayland;'
+$SessionEnv = 'export XDG_RUNTIME_DIR=/run/user/$(id -u); export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; export WAYLAND_DISPLAY=$(ls $XDG_RUNTIME_DIR 2>/dev/null | grep -E "^wayland-[0-9]+$" | head -1); export QT_QPA_PLATFORM=wayland LC_ALL=C.UTF-8;'
 
 function Guest([string]$cmd) {
     & ssh -i $SshKey -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes "$GuestUser@$GuestIp" "$SessionEnv $cmd" 2>&1 | Out-String
@@ -146,8 +146,8 @@ $unit = (Guest 'systemctl --user is-active wayrdp 2>&1').Trim()
 Assert "K0c-wayrdp-active" ($unit -eq 'active') "systemctl --user is-active wayrdp = $unit"
 $svcLog = Guest 'S=$(systemctl --user show wayrdp -p ActiveEnterTimestamp --value); { [ -f /tmp/wayrdp-trace.log ] && tail -n 400 /tmp/wayrdp-trace.log; journalctl --user -u wayrdp -o cat --no-pager --since "$S"; } 2>/dev/null'
 Assert "K0d-kde-backend" ((Count $svcLog 'preflight: KWin') -ge 1) "daemon log has '[backend-kde] preflight: KWin' (unit runs the kde backend)"
-$kwinVer = (Guest 'kwin_wayland --version 2>&1').Trim()
-$verOk = $kwinVer -match '(\d+)\.(\d+)' -and (([int]$Matches[1] -gt 6) -or ([int]$Matches[1] -eq 6 -and [int]$Matches[2] -ge 3))
+$kwinVer = (Guest 'kwin_wayland --version 2>/dev/null').Trim()
+$verOk = $kwinVer -match 'kwin\S* (\d+)\.(\d+)' -and (([int]$Matches[1] -gt 6) -or ([int]$Matches[1] -eq 6 -and [int]$Matches[2] -ge 3))
 Assert "K0e-kwin-version" $verOk "kwin_wayland --version: $kwinVer (need >= 6.3)"
 $layout0 = Layout
 $phys0 = EnabledPhysical $layout0
