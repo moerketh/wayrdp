@@ -32,6 +32,7 @@
 #include <freerdp/codec/rfx.h>
 #include <freerdp/codec/color.h>
 #include <winpr/input.h>
+#include <freerdp/transport_io.h>
 
 /* WinPR wait/event helpers. These live in <winpr/synch.h> but are not under
  * a `freerdp_*` allowlist prefix, so bindgen drops them. The peer event loop
@@ -535,4 +536,30 @@ DWORD wayrdp_rdp_scancode_to_evdev(DWORD scancode)
 		return 0;
 	DWORD key = GetKeycodeFromVirtualKeyCode(vk, WINPR_KEYCODE_TYPE_EVDEV);
 	return (key == 0 || key == 0xFFFF) ? 0 : key;
+}
+
+/* Hyper-V vmconnect over vsock: the host proxy terminates the client's TLS
+ * and forwards the inner RDP stream in plaintext, but still negotiates
+ * PROTOCOL_SSL. FreeRDP >= 3.16 handles that with VmConnectMode (skip the
+ * accept when security != RDP); 3.15 and older (Debian 13 / Parrot 7) ignore
+ * the flag on the server side and run a real TLS accept on the vsock stream,
+ * which fails with "wrong version number". Replacing this peer's TLSAccept
+ * with a no-op is exactly what VmConnectMode does, and is harmless on newer
+ * FreeRDP, where the flag short-circuits before the callback is reached. */
+static BOOL wayrdp_tls_accept_noop(rdpTransport* transport)
+{
+	(void)transport;
+	return TRUE;
+}
+
+BOOL wayrdp_vsock_skip_tls_accept(rdpContext* context)
+{
+	if (!context)
+		return FALSE;
+	const rdpTransportIo* cur = freerdp_get_io_callbacks(context);
+	if (!cur)
+		return FALSE;
+	rdpTransportIo io = *cur;
+	io.TLSAccept = wayrdp_tls_accept_noop;
+	return freerdp_set_io_callbacks(context, &io);
 }

@@ -354,6 +354,13 @@ unsafe fn peer_accepted_inner(
             FreeRDP_Settings_Keys_Bool_FreeRDP_VmConnectMode,
             1,
         );
+        // FreeRDP < 3.16 ignores VmConnectMode on the server side and runs a
+        // real TLS accept when vmconnect negotiates SSL (Parrot 7 / Debian 13
+        // ship 3.15): replace the accept with the same no-op.
+        if wayrdp_vsock_skip_tls_accept((*client).context) == 0 {
+            eprintln!("[peer_accepted] could not install the vsock TLS-accept override; rejecting");
+            return 0;
+        }
         freerdp_settings_set_uint32(
             settings,
             wayrdp_settings_key_uint32_encryption_methods() as FreeRDP_Settings_Keys_UInt32,
