@@ -6,6 +6,11 @@
 //! layout guard, containment heal) stays inside extras — this crate must
 //! never fork that logic. libei input injection is authored fresh here.
 
+pub mod health;
+pub mod input_map;
+pub mod recovery;
+pub mod resize;
+
 use desk_backend::{BackendError, DesktopBackend, SessionRequest};
 
 /// Placeholder so dependency wiring is exercised from day one. The real
