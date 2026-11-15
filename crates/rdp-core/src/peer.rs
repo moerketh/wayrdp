@@ -306,7 +306,9 @@ unsafe fn peer_accepted_inner(
     eprintln!("[peer_accepted] vcm ok, vcm={:?}", (*ctx).vcm);
 
     let cert = freerdp_certificate_new_from_file(state.cert_path.as_ptr());
-    let key = freerdp_key_new_from_file_enc(state.key_path.as_ptr(), ptr::null());
+    // Not _enc: that symbol is newer than Debian 13 / Parrot 7 (FreeRDP
+    // 3.15), and the key is unencrypted anyway.
+    let key = freerdp_key_new_from_file(state.key_path.as_ptr());
     if cert.is_null() || key.is_null() {
         if !cert.is_null() {
             freerdp_certificate_free(cert);
