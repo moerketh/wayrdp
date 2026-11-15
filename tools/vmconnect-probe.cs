@@ -115,6 +115,22 @@ public class VmConnectProbe {
 
     // --- X.224 / TPKT helpers -------------------------------------------
     // TPKT: 03 00 <len-hi> <len-lo> | X.224: <li> E0(CR)/D0(CC) 00 00 00 00 00
+    // --neg-ssl: what real vmconnect sends through the Hyper-V host proxy: a
+    // CR carrying RDP_NEG_REQ(PROTOCOL_SSL). The proxy terminates TLS itself,
+    // so the guest server must answer RDP_NEG_RSP(SSL) and then keep reading
+    // PLAINTEXT. FreeRDP < 3.16 instead started a TLS accept and failed
+    // ("wrong version number"), which the no-nego CR below never exercises.
+    static bool negSsl;
+    static byte[] BuildX224CrNegSsl() {
+        // TPKT len = 4 + 1 (LI) + 6 (CR) + 8 (RDP_NEG_REQ) = 19; LI = 14.
+        return new byte[] {
+            0x03, 0x00, 0x00, 0x13,
+            0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x08, 0x00,               // RDP_NEG_REQ, flags 0, len 8
+            0x01, 0x00, 0x00, 0x00                // requestedProtocols = PROTOCOL_SSL
+        };
+    }
+
     static byte[] BuildX224Cr() {
         // X.224 CR, fixed 6-byte header, dst-ref=0 src-ref=0 class=0, NO
         // RDP_NEG_REQ (that's the whole point — vmconnect does not negotiate).
@@ -357,11 +373,12 @@ public class VmConnectProbe {
     }
 
     public static int Main(string[] args) {
-        if (args.Length < 2) { Console.WriteLine("usage: vmconnect-probe <vmGuid> <serviceGuid> [--seconds N] [--send-input] [--die-at-stage N]"); return 2; }
+        if (args.Length < 2) { Console.WriteLine("usage: vmconnect-probe <vmGuid> <serviceGuid> [--seconds N] [--send-input] [--neg-ssl] [--die-at-stage N]"); return 2; }
         int settleSec = 2;
         for (int i = 2; i < args.Length; i++) {
             if (args[i] == "--seconds" && i + 1 < args.Length) settleSec = int.Parse(args[++i]);
             else if (args[i] == "--send-input") sendInput = true;
+            else if (args[i] == "--neg-ssl") negSsl = true;
             else if (args[i] == "--die-at-stage" && i + 1 < args.Length) dieAtStage = int.Parse(args[++i]);
         }
         Guid vmId = new Guid(args[0]);
@@ -384,7 +401,7 @@ public class VmConnectProbe {
             Pass("connect", "AF_HYPERV connected to " + vmId + " svc " + svc);
 
             // S2 X.224 CC
-            SendAll(s, BuildX224Cr());
+            SendAll(s, negSsl ? BuildX224CrNegSsl() : BuildX224Cr());
             var buf = new byte[4096];
             int n = RecvTimeout(s, buf, 8000);
             if (n <= 0) Fail("x224-cc", "no CC within 8s (recv=" + n + ")");
@@ -393,6 +410,14 @@ public class VmConnectProbe {
             // and 0xD0 = CC. Don't pin LI; accept the D0-type PDU.
             if (n >= 6 && buf[0] == 0x03 && buf[5] == 0xd0) {
                 Pass("x224-cc", "server sent Connection Confirm (len=" + n + ")");
+                if (negSsl) {
+                    // RDP_NEG_RSP follows the 7-byte X.224 CC: type 0x02, then
+                    // selectedProtocol (LE u32) at offset 4 of the structure.
+                    if (n >= 19 && buf[11] == 0x02 && buf[15] == 0x01)
+                        Pass("neg-ssl", "server selected PROTOCOL_SSL; continuing in plaintext like the host proxy");
+                    else
+                        Fail("neg-ssl", "no RDP_NEG_RSP(SSL): " + BitConverter.ToString(buf, 0, Math.Min(n, 19)));
+                }
             } else {
                 Fail("x224-cc", "unexpected bytes: " + BitConverter.ToString(buf, 0, Math.Min(n, 16)));
             }

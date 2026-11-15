@@ -12,7 +12,9 @@
 #                       active and on the kde backend, KWin >= 6.3, a clean
 #                       output layout (no stale Virtual-wayrdp, >= 1 enabled
 #                       physical output), auto-lock off, /tmp writable.
-#   A1  connection    - prober completed the vmconnect handshake
+#   A1  connection    - prober completed the vmconnect handshake, negotiating
+#                       PROTOCOL_SSL like real vmconnect (--neg-ssl; churn
+#                       below uses the no-negotiation CR)
 #   A2  single-peer   - exactly one peer_accepted this run
 #   A3  activation    - gate reached activated=1
 #   K4  output        - "session: live at" once; Virtual-wayrdp enabled and
@@ -164,7 +166,7 @@ $mark = Mark
 $probeJob = Start-Job -ScriptBlock {
     $p = $args[0]; $rest = $args[1..($args.Count - 1)]
     & $p @rest 2>&1 | Out-String
-} -ArgumentList @($probe, $vmGuidStr, $rdpGuid, '--seconds', "$HoldSec", '--send-input')
+} -ArgumentList @($probe, $vmGuidStr, $rdpGuid, '--seconds', "$HoldSec", '--send-input', '--neg-ssl')
 $sawVirtual = $false; $sawGuarded = $false; $holdSamples = 0
 $deadline = (Get-Date).AddSeconds($HoldSec + 25)
 while ((Get-Date) -lt $deadline -and $probeJob.State -eq 'Running') {
