@@ -182,9 +182,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "capture-pipewire",
+ "crossbeam-channel",
  "desk-backend",
  "futures-util",
  "input-eis",
+ "libc",
  "serde",
  "tokio",
  "zbus",

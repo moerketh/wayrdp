@@ -17,3 +17,6 @@ zbus = { version = "5", default-features = false, features = ["blocking-api", "a
 futures-util = { version = "0.3", default-features = false }
 serde = "1"
 anyhow = "1"
+# Clipboard events channel (desk-backend::Clipboard) and pipe fds.
+crossbeam-channel = "0.5.17"
+libc = "0.2"

@@ -11,12 +11,15 @@
 //! - `gnome-session`: current-thread tokio runtime owning the Mutter session,
 //!   layout guard, health and resize (`session.rs`);
 //! - `gnome-pipewire`: PipeWire main loop (capture-pipewire);
-//! - `gnome-input`: EIS poll loop (input-eis).
+//! - `gnome-input`: EIS poll loop (input-eis);
+//! - `gnome-clipboard`: per peer, a clipboard-only RemoteDesktop session
+//!   (`clipboard.rs`).
 //!
 //! Unlike KDE there is no shell to restart: gnome-shell is the compositor,
 //! so a heal re-applies the layout guard and the strongest repair is a new
 //! Mutter session.
 
+pub mod clipboard;
 pub mod input;
 pub mod layout;
 pub mod mutter;
@@ -90,9 +93,9 @@ impl DesktopBackend for GnomeBackend {
         }))
     }
 
-    /// Clipboard comes later (WP9).
+    /// Mutter's RemoteDesktop selection API, on a session of its own.
     fn open_clipboard(&self) -> Option<Box<dyn desk_backend::Clipboard>> {
-        None
+        Some(Box::new(clipboard::MutterClipboard::new()))
     }
 }
 
