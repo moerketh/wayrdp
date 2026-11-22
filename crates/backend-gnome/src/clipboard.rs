@@ -361,6 +361,10 @@ impl Session {
                         continue;
                     }
                     *offer = None;
+                    eprintln!(
+                        "[backend-gnome] clipboard: local selection, {} type(s)",
+                        mimes.len()
+                    );
                     let _ = events.send(ClipboardEvent::LocalSelection { mimes });
                 }
                 m = self.transfer.next() => {
@@ -388,8 +392,14 @@ impl Session {
         }) {
             Ok(fd) => fd,
             Err(e) => {
-                eprintln!("[backend-gnome] clipboard: {e:#}");
-                let _ = self.call("SelectionWriteDone", &(serial, false)).await;
+                // A newer SetSelection (another client copy) cancels the
+                // transfers still pending; that one is already answered.
+                if format!("{e:#}").contains("doesn't match any transfer") {
+                    eprintln!("[backend-gnome] clipboard: transfer {serial} superseded");
+                } else {
+                    eprintln!("[backend-gnome] clipboard: {e:#}");
+                    let _ = self.call("SelectionWriteDone", &(serial, false)).await;
+                }
                 return;
             }
         };
@@ -411,10 +421,19 @@ impl Session {
 }
 
 /// `SelectionOwnerChanged` options → (mime types, session-is-owner).
+///
+/// Mutter 50 sends `mime-types` as a one-element tuple, `(as)`, although
+/// its XML documents `as`; accept both.
 fn owner_change(opts: &HashMap<String, OwnedValue>) -> (Vec<String>, bool) {
     let mimes = opts
         .get("mime-types")
-        .and_then(|v| Vec::<String>::try_from(v.try_clone().ok()?).ok())
+        .and_then(|v| {
+            let v = v.try_clone().ok()?;
+            if let Ok((list,)) = <(Vec<String>,)>::try_from(v.try_clone().ok()?) {
+                return Some(list);
+            }
+            Vec::<String>::try_from(v).ok()
+        })
         .unwrap_or_default();
     let ours = opts
         .get("session-is-owner")
@@ -526,12 +545,13 @@ fn read_until_eof(fd: OwnedFd, deadline: Instant, max: usize) -> std::io::Result
 mod tests {
     use super::*;
 
+    /// The shape Mutter 50 sends: `mime-types` is `(as)`.
     fn opts(mimes: &[&str], ours: Option<bool>) -> HashMap<String, OwnedValue> {
         let mut m = HashMap::new();
         let list: Vec<String> = mimes.iter().map(|s| s.to_string()).collect();
         m.insert(
             "mime-types".to_string(),
-            OwnedValue::try_from(Value::from(list)).unwrap(),
+            OwnedValue::try_from(Value::from((list,))).unwrap(),
         );
         if let Some(o) = ours {
             m.insert(
@@ -548,6 +568,16 @@ mod tests {
             owner_change(&opts(&["text/plain;charset=utf-8", "TARGETS"], Some(false)));
         assert_eq!(mimes, ["text/plain;charset=utf-8", "TARGETS"]);
         assert!(!ours);
+    }
+
+    #[test]
+    fn plain_string_array_is_accepted_too() {
+        let list = vec!["text/plain".to_string()];
+        let m = HashMap::from([(
+            "mime-types".to_string(),
+            OwnedValue::try_from(Value::from(list)).unwrap(),
+        )]);
+        assert_eq!(owner_change(&m).0, ["text/plain"]);
     }
 
     #[test]
