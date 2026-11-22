@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use desk_backend::Size;
+use crate::Size;
 
 /// Quiet period after the last size change before it is applied.
 pub const DEBOUNCE: Duration = Duration::from_millis(250);

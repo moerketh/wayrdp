@@ -1,19 +1,24 @@
-//! PipeWire capture (the "kde-pipewire" thread): consumes KWin's
-//! zkde-screencast node on the user's session PipeWire daemon and turns its
-//! buffers into desk-backend frames.
+//! PipeWire capture thread: consumes a compositor's screencast node (KWin's
+//! zkde-screencast, Mutter's ScreenCast stream) on the user's session
+//! PipeWire daemon and turns its buffers into desk-backend frames.
 //!
 //! Hyper-V rules, from field findings:
 //! - **Never offer a DRM modifier.** On `hyperv_drm` with Mesa software
 //!   rendering, a negotiated DmaBuf whose EGL import fails loops KWin's
 //!   format negotiation forever. KWin only enters its DmaBuf path when the
 //!   consumer's format carries `SPA_FORMAT_VIDEO_modifier`, so offering none
-//!   keeps the stream on MemFd.
+//!   keeps the stream on MemFd. The same rule holds for Mutter.
 //! - Connect on the **shared** daemon (`connect(None)`), never a portal fd:
-//!   the zkde node is published there, and portal private connections have
-//!   a buffer-allocation bug on Hyper-V.
+//!   both compositors publish their node there, and portal private
+//!   connections have a buffer-allocation bug on Hyper-V.
 //! - Use `chunk.stride`, never `width * 4`: padded strides exist.
-//! - KWin sends frames only on damage and also sends empty (cursor-only)
+//! - Compositors send frames only on damage and may send empty (cursor-only)
 //!   buffers; both are normal.
+//! - Size: with [`Command::Connect`] `size: None` the producer picks it (KWin
+//!   sizes its own virtual output). With `Some(size)` the offer is exactly
+//!   that size, which is how a Mutter virtual monitor gets its size; a later
+//!   [`Command::Resize`] renegotiates. An unchanged size is never resent
+//!   (Mutter once crashed on that, mutter#1904).
 //!
 //! Commands arrive on a `pipewire::channel` attached to the loop, so they run
 //! on this thread. Health summaries go back to the session task on a tokio
@@ -36,10 +41,28 @@ use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
 use crate::health::{sample_uniform, Sample, CONNECT_WINDOW};
 
 pub enum Command {
-    /// (Re)connect to this zkde node, dropping any current stream.
-    Connect(u32),
+    /// (Re)connect to this node, dropping any current stream. `size: None`
+    /// accepts any size; `Some` offers exactly that size.
+    Connect {
+        node: u32,
+        size: Option<Size>,
+    },
+    /// Renegotiate a fixed-size stream to a new size (no-op when unchanged
+    /// or when the stream was connected with `size: None`).
+    Resize(Size),
     Disconnect,
     Shutdown,
+}
+
+/// Names for one backend's capture thread and its log lines.
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    /// Thread name, e.g. `kde-pipewire`.
+    pub thread: &'static str,
+    /// Log prefix, e.g. `[backend-kde]`.
+    pub tag: &'static str,
+    /// PipeWire stream (node) name, e.g. `wayrdp-kde`.
+    pub stream_name: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,11 +124,45 @@ fn prop(key: u32, value: Value) -> Property {
     }
 }
 
-/// EnumFormat: BGRx/BGRA, any size, 0–60 fps. Deliberately no modifier
-/// property (see the module docs).
-fn enum_format() -> Vec<u8> {
+/// EnumFormat: BGRx/BGRA, 0–60 fps, any size or exactly `size`.
+/// Deliberately no modifier property (see the module docs).
+fn enum_format(size: Option<Size>) -> Vec<u8> {
     use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     use spa::param::video::VideoFormat;
+    if let Some(size) = size {
+        return pod_bytes(spa::pod::object!(
+            spa::utils::SpaTypes::ObjectParamFormat,
+            spa::param::ParamType::EnumFormat,
+            spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+            spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+            spa::pod::property!(
+                FormatProperties::VideoFormat,
+                Choice,
+                Enum,
+                Id,
+                VideoFormat::BGRx,
+                VideoFormat::BGRx,
+                VideoFormat::BGRA
+            ),
+            spa::pod::property!(
+                FormatProperties::VideoSize,
+                Rectangle,
+                spa::utils::Rectangle {
+                    width: size.width,
+                    height: size.height
+                }
+            ),
+            spa::pod::property!(
+                FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                spa::utils::Fraction { num: 60, denom: 1 },
+                spa::utils::Fraction { num: 0, denom: 1 },
+                spa::utils::Fraction { num: 60, denom: 1 }
+            ),
+        ));
+    }
     pod_bytes(spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamFormat,
         spa::param::ParamType::EnumFormat,
@@ -211,6 +268,7 @@ struct StreamData {
     last_sample: Option<Instant>,
     streaming: bool,
     debug: bool,
+    tag: &'static str,
     stats: Stats,
 }
 
@@ -251,7 +309,8 @@ impl StreamData {
         let s = std::mem::take(&mut self.stats);
         let n = s.frames.max(1) as u64;
         eprintln!(
-            "[backend-kde] capture: {:.1} fps, {} empty, copy {:.2} ms avg, {:.1} damage rects avg",
+            "{} capture: {:.1} fps, {} empty, copy {:.2} ms avg, {:.1} damage rects avg",
+            self.tag,
             s.frames as f64 / elapsed.as_secs_f64(),
             s.empty,
             s.copy_us as f64 / n as f64 / 1000.0,
@@ -264,26 +323,30 @@ impl StreamData {
 struct Active {
     stream: pw::stream::StreamRc,
     _listener: pw::stream::StreamListener<StreamData>,
+    /// The fixed size offered, `None` for "any size".
+    size: Option<Size>,
 }
 
 /// Spawn the capture thread. Idle until it receives [`Command::Connect`].
 pub fn spawn(
+    cfg: Config,
     frames: FrameTx,
     wake: Option<FrameWake>,
     events: EventTx,
 ) -> std::io::Result<(CommandTx, std::thread::JoinHandle<()>)> {
     let (tx, rx) = pw::channel::channel::<Command>();
     let handle = std::thread::Builder::new()
-        .name("kde-pipewire".into())
+        .name(cfg.thread.into())
         .spawn(move || {
-            if let Err(e) = run(rx, frames, wake, events) {
-                eprintln!("[backend-kde] capture thread failed: {e}");
+            if let Err(e) = run(cfg, rx, frames, wake, events) {
+                eprintln!("{} capture thread failed: {e}", cfg.tag);
             }
         })?;
     Ok((tx, handle))
 }
 
 fn run(
+    cfg: Config,
     rx: pw::channel::Receiver<Command>,
     frames: FrameTx,
     wake: Option<FrameWake>,
@@ -298,27 +361,49 @@ fn run(
 
     let ml = mainloop.clone();
     let active_cmd = active.clone();
+    let tag = cfg.tag;
     let _attached = rx.attach(mainloop.loop_(), move |cmd| match cmd {
-        Command::Connect(node) => {
+        Command::Connect { node, size } => {
             if let Some(old) = active_cmd.borrow_mut().take() {
                 let _ = old.stream.disconnect();
             }
             match connect(
+                cfg,
                 &core,
                 node,
+                size,
                 frames.clone(),
                 wake.clone(),
                 events.clone(),
                 debug,
             ) {
                 Ok(a) => {
-                    eprintln!("[backend-kde] capture: connecting to node {node}");
+                    eprintln!("{tag} capture: connecting to node {node}");
                     *active_cmd.borrow_mut() = Some(a);
                 }
                 Err(e) => {
-                    eprintln!("[backend-kde] capture: connect to node {node} failed: {e}");
+                    eprintln!("{tag} capture: connect to node {node} failed: {e}");
                     let _ = events.send(Event::StreamLost(Instant::now()));
                 }
+            }
+        }
+        Command::Resize(size) => {
+            let mut guard = active_cmd.borrow_mut();
+            let Some(a) = guard.as_mut() else { return };
+            if a.size.is_none() || a.size == Some(size) {
+                return;
+            }
+            let format = enum_format(Some(size));
+            let mut params = [Pod::from_bytes(&format).expect("valid EnumFormat pod")];
+            match a.stream.update_params(&mut params) {
+                Ok(()) => {
+                    eprintln!(
+                        "{tag} capture: renegotiating {}x{}",
+                        size.width, size.height
+                    );
+                    a.size = Some(size);
+                }
+                Err(e) => eprintln!("{tag} capture: resize renegotiation failed: {e}"),
             }
         }
         Command::Disconnect => {
@@ -337,9 +422,12 @@ fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect(
+    cfg: Config,
     core: &pw::core::CoreRc,
     node: u32,
+    size: Option<Size>,
     frames: FrameTx,
     wake: Option<FrameWake>,
     events: EventTx,
@@ -347,7 +435,7 @@ fn connect(
 ) -> Result<Active, pw::Error> {
     let stream = pw::stream::StreamRc::new(
         core.clone(),
-        "wayrdp-kde",
+        cfg.stream_name,
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",
             *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -363,12 +451,13 @@ fn connect(
         last_sample: None,
         streaming: false,
         debug,
+        tag: cfg.tag,
         stats: Stats::default(),
     };
     let listener = stream
         .add_local_listener_with_user_data(data)
         .state_changed(|_, d, old, new| {
-            eprintln!("[backend-kde] capture: stream {old:?} -> {new:?}");
+            eprintln!("{} capture: stream {old:?} -> {new:?}", d.tag);
             match new {
                 pw::stream::StreamState::Streaming => d.streaming = true,
                 pw::stream::StreamState::Error(_) | pw::stream::StreamState::Unconnected
@@ -390,7 +479,8 @@ fn connect(
             }
             let size = d.format.size();
             eprintln!(
-                "[backend-kde] capture: format {:?} {}x{}",
+                "{} capture: format {:?} {}x{}",
+                d.tag,
                 d.format.format(),
                 size.width,
                 size.height
@@ -401,13 +491,13 @@ fn connect(
             let params = buffer_params();
             let mut pods: Vec<&Pod> = params.iter().filter_map(|b| Pod::from_bytes(b)).collect();
             if let Err(e) = stream.update_params(&mut pods) {
-                eprintln!("[backend-kde] capture: update_params failed: {e}");
+                eprintln!("{} capture: update_params failed: {e}", d.tag);
             }
         })
         .process(process)
         .register()?;
 
-    let format = enum_format();
+    let format = enum_format(size);
     let mut params = [Pod::from_bytes(&format).expect("valid EnumFormat pod")];
     stream.connect(
         spa::utils::Direction::Input,
@@ -418,6 +508,7 @@ fn connect(
     Ok(Active {
         stream,
         _listener: listener,
+        size,
     })
 }
 
@@ -553,7 +644,12 @@ mod tests {
 
     #[test]
     fn format_and_buffer_pods_serialize() {
-        assert!(Pod::from_bytes(&enum_format()).is_some());
+        assert!(Pod::from_bytes(&enum_format(None)).is_some());
+        let fixed = Size {
+            width: 1280,
+            height: 800,
+        };
+        assert!(Pod::from_bytes(&enum_format(Some(fixed))).is_some());
         for p in buffer_params() {
             assert!(Pod::from_bytes(&p).is_some());
         }

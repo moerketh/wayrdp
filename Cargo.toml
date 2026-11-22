@@ -5,6 +5,8 @@ members = [
     "crates/desk-backend",
     "crates/input-keymap",
     "crates/rdp-core",
+    "crates/capture-pipewire",
+    "crates/input-eis",
     "crates/backend-kde",
     "crates/backend-wlroots",
     "crates/clipboard-wayland",

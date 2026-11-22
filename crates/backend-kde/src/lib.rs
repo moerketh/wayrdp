@@ -13,15 +13,23 @@
 //!   (`capture.rs`);
 //! - `kde-input`: EIS poll loop (`input.rs`).
 
-pub mod capture;
-pub mod health;
 pub mod input;
-pub mod input_map;
 pub mod preflight;
 pub mod recovery;
-pub mod resize;
 pub mod session;
 pub mod shell;
+
+// Shared with the GNOME backend; re-exported under their old paths.
+pub use capture_pipewire::{capture, health};
+pub use desk_backend::resize;
+pub use input_eis::input_map;
+
+/// Capture thread and log names; the KDE harness greps these log lines.
+const CAPTURE: capture::Config = capture::Config {
+    thread: "kde-pipewire",
+    tag: "[backend-kde]",
+    stream_name: "wayrdp-kde",
+};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -104,8 +112,8 @@ impl CaptureSession for KdeCaptureSession {
         }
         let io = |e: std::io::Error| BackendError::Other(e.into());
         let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (cmd, capture) = capture::spawn(tx, self.wake.clone(), ev_tx).map_err(io)?;
-        let input = match Input::spawn() {
+        let (cmd, capture) = capture::spawn(CAPTURE, tx, self.wake.clone(), ev_tx).map_err(io)?;
+        let input = match input::spawn() {
             Ok(i) => Arc::new(i),
             Err(e) => {
                 let _ = cmd.send(capture::Command::Shutdown);

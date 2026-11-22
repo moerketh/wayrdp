@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+pub mod resize;
 pub mod stats;
 
 #[derive(Debug, Error)]

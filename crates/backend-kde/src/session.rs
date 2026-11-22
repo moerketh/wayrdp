@@ -156,7 +156,7 @@ struct Live {
 impl Live {
     fn connected(&mut self, node: u32) {
         let now = Instant::now();
-        let _ = self.capture.send(Command::Connect(node));
+        let _ = self.capture.send(Command::Connect { node, size: None });
         self.health.observe(Observation::Connected(now));
         self.health
             .observe(Observation::LayoutSettled(now + CREATE_SETTLE));

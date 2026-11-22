@@ -1,0 +1,16 @@
+[package]
+name = "input-eis"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wayrdp input injection over libei (EIS), shared by the KDE and GNOME backends"
+
+[dependencies]
+desk-backend = { path = "../desk-backend" }
+input-keymap = { path = "../input-keymap" }
+reis = "0.7"
+xkbcommon = "0.8"
+crossbeam-channel = "0.5.17"
+libc = "0.2"
+anyhow = "1"

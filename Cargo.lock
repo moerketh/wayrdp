@@ -181,17 +181,13 @@ name = "backend-kde"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "capture-pipewire",
  "clipboard-wayland",
- "crossbeam-channel",
  "desk-backend",
  "hyperv-rdp-extras",
+ "input-eis",
  "input-keymap",
- "libc",
- "pipewire",
- "reis",
- "thiserror",
  "tokio",
- "xkbcommon",
  "zbus",
 ]
 
@@ -287,6 +283,16 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "capture-pipewire"
+version = "0.1.0"
+dependencies = [
+ "desk-backend",
+ "input-keymap",
+ "pipewire",
+ "tokio",
+]
 
 [[package]]
 name = "cc"
@@ -605,6 +611,19 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown",
+]
+
+[[package]]
+name = "input-eis"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "desk-backend",
+ "input-keymap",
+ "libc",
+ "reis",
+ "xkbcommon",
 ]
 
 [[package]]

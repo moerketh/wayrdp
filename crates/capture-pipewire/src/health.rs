@@ -1,8 +1,9 @@
-//! Connect-time health monitor: decides WHEN to heal the Plasma layout or
-//! recreate the virtual output. The heal MECHANICS live in
-//! hyperv-rdp-extras (`heal_output_layout`); this module only turns
-//! observations into actions, as a pure state machine so every rule is
-//! unit-tested without KWin.
+//! Connect-time health monitor: decides WHEN to heal the desktop layout or
+//! recreate the virtual output. The heal MECHANICS belong to each backend
+//! (KDE: extras' `heal_output_layout`, escalation = plasmashell restart;
+//! GNOME: re-apply the layout guard, no escalation lever). This module only
+//! turns observations into actions, as a pure state machine so every rule is
+//! unit-tested without a compositor.
 //!
 //! Signals, computed by the capture thread from a sparse pixel sample (never
 //! whole frames):
@@ -92,7 +93,8 @@ pub enum Observation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
-    /// Run `heal_output_layout`; `escalate` also restarts plasmashell.
+    /// Heal the layout. `escalate` asks for the backend's disruptive heal
+    /// (KDE: plasmashell restart); a backend without one heals as usual.
     Heal {
         escalate: bool,
     },
