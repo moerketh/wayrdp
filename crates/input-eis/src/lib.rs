@@ -66,6 +66,8 @@ enum Msg {
     Connect,
     /// Current virtual output size, used to pick the right absolute region.
     Size(u32, u32),
+    /// Name or mapping id of the virtual output's region.
+    Region(String),
     Shutdown,
 }
 
@@ -133,6 +135,12 @@ impl Input {
     /// The virtual output was created or resized to `width x height`.
     pub fn set_size(&self, width: u32, height: u32) {
         self.send(Msg::Size(width, height));
+    }
+
+    /// The virtual output's region name or mapping id changed (a recreated
+    /// output can get a new one).
+    pub fn set_region(&self, region: String) {
+        self.send(Msg::Region(region));
     }
 
     /// Release held keys, close EIS, join the thread. Idempotent.
@@ -524,7 +532,7 @@ impl Eis {
 
 fn run(
     cfg: Config,
-    region: String,
+    mut region: String,
     mut connector: Connector,
     rx: Receiver<Msg>,
     wake: Arc<OwnedFd>,
@@ -616,6 +624,7 @@ fn run(
                     retry = None;
                 }
                 Msg::Size(w, h) => session = (w, h),
+                Msg::Region(r) => region = r,
                 Msg::Input(ev) => pending.push(ev),
             }
         }

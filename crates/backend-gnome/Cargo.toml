@@ -1,0 +1,19 @@
+[package]
+name = "backend-gnome"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wayrdp GNOME backend — Mutter virtual monitor over the RemoteDesktop/ScreenCast D-Bus API"
+
+[dependencies]
+desk-backend = { path = "../desk-backend" }
+capture-pipewire = { path = "../capture-pipewire" }
+input-eis = { path = "../input-eis" }
+# Session thread runtime (select over Mutter signals, capture events, ticks).
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+# Mutter's org.gnome.Mutter.{RemoteDesktop,ScreenCast,DisplayConfig}.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+futures-util = { version = "0.3", default-features = false }
+serde = "1"
+anyhow = "1"

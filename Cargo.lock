@@ -177,6 +177,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "backend-gnome"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "capture-pipewire",
+ "desk-backend",
+ "futures-util",
+ "input-eis",
+ "serde",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "backend-kde"
 version = "0.1.0"
 dependencies = [
@@ -1527,6 +1541,7 @@ name = "wayrdp"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "backend-gnome",
  "backend-kde",
  "backend-wlroots",
  "desk-backend",

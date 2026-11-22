@@ -8,6 +8,7 @@ members = [
     "crates/capture-pipewire",
     "crates/input-eis",
     "crates/backend-kde",
+    "crates/backend-gnome",
     "crates/backend-wlroots",
     "crates/clipboard-wayland",
     "server",

@@ -11,8 +11,8 @@
 //!   0.0.0.0:3389; that must never happen implicitly again.
 //!
 //! Backend selection: `WAYRDP_BACKEND` env — `wlroots` (Hyprland), `kde`
-//! (Plasma 6.3+) or `synthetic`. Unset = auto-detect from
-//! XDG_CURRENT_DESKTOP (F12): Hyprland→wlroots, KDE→kde; Sway is detected
+//! (Plasma 6.3+), `gnome` (Mutter) or `synthetic`. Unset = auto-detect from
+//! XDG_CURRENT_DESKTOP (F12): Hyprland→wlroots, KDE→kde, GNOME→gnome; Sway is detected
 //! but has no working backend (wlroots drives Hyprland only), so startup
 //! fails there with a clear error rather than showing a vmconnect user the
 //! synthetic test pattern. `WAYRDP_BACKEND=synthetic` is the escape hatch.
@@ -69,6 +69,18 @@ fn main() -> anyhow::Result<()> {
             // Restore physical outputs a crashed previous run left disabled.
             backend_kde::recovery::recover_at_startup();
             Box::new(backend_kde::KdeBackend)
+        }
+        Ok(Backend::Gnome) => {
+            use backend_gnome::preflight::{preflight, Failure};
+            if let Err(f) = preflight() {
+                eprintln!("[wayrdp] gnome backend: {f}");
+                std::process::exit(match f {
+                    Failure::Permanent(_) => selected_backend::EXIT_NO_BACKEND,
+                    Failure::Transient(_) => 1,
+                });
+            }
+            backend_gnome::recover_at_startup();
+            Box::new(backend_gnome::GnomeBackend)
         }
         Ok(Backend::Synthetic) => Box::new(rdp_core::synthetic::SyntheticBackend),
         Err(e) => {
@@ -134,6 +146,7 @@ fn tcp_bind_ip() -> anyhow::Result<std::net::IpAddr> {
 enum Backend {
     Wlroots,
     Kde,
+    Gnome,
     Synthetic,
 }
 
@@ -172,6 +185,7 @@ fn detected_backend(desktops: &str) -> anyhow::Result<Backend> {
         match tag.to_ascii_lowercase().as_str() {
             "hyprland" => return Ok(Backend::Wlroots),
             "kde" | "plasma" => return Ok(Backend::Kde),
+            "gnome" => return Ok(Backend::Gnome),
             "sway" => {
                 let e = anyhow::anyhow!(
                     "XDG_CURRENT_DESKTOP={desktops} has no working wayrdp backend \
@@ -222,9 +236,10 @@ fn explicit_backend(value: &str) -> anyhow::Result<Backend> {
     match value {
         "wlroots" => Ok(Backend::Wlroots),
         "kde" => Ok(Backend::Kde),
+        "gnome" => Ok(Backend::Gnome),
         "synthetic" => Ok(Backend::Synthetic),
         other => Err(selected_backend::EXIT_NO_BACKEND.apply(anyhow::anyhow!(
-            "unknown WAYRDP_BACKEND={other:?}; use wlroots, kde or synthetic"
+            "unknown WAYRDP_BACKEND={other:?}; use wlroots, kde, gnome or synthetic"
         ))),
     }
 }
@@ -383,6 +398,7 @@ mod tests {
     fn known_backend_values_resolve() {
         assert!(matches!(explicit_backend("wlroots"), Ok(Backend::Wlroots)));
         assert!(matches!(explicit_backend("kde"), Ok(Backend::Kde)));
+        assert!(matches!(explicit_backend("gnome"), Ok(Backend::Gnome)));
         assert!(matches!(
             explicit_backend("synthetic"),
             Ok(Backend::Synthetic)
@@ -395,7 +411,12 @@ mod tests {
         assert!(matches!(detected_backend("KDE"), Ok(Backend::Kde)));
         assert!(matches!(detected_backend("ubuntu:KDE"), Ok(Backend::Kde)));
         assert!(matches!(detected_backend("plasma"), Ok(Backend::Kde)));
-        assert!(matches!(detected_backend("GNOME"), Ok(Backend::Synthetic)));
+        assert!(matches!(detected_backend("GNOME"), Ok(Backend::Gnome)));
+        assert!(matches!(
+            detected_backend("ubuntu:GNOME"),
+            Ok(Backend::Gnome)
+        ));
+        assert!(matches!(detected_backend("XFCE"), Ok(Backend::Synthetic)));
         assert!(matches!(detected_backend(""), Ok(Backend::Synthetic)));
         let Err(e) = detected_backend("sway") else {
             panic!("sway must not select a backend");
@@ -408,7 +429,7 @@ mod tests {
 
     #[test]
     fn typos_exit_with_no_backend_status() {
-        for value in ["KDE", "wlroot", "Wlroots", "plasma"] {
+        for value in ["KDE", "GNOME", "wlroot", "Wlroots", "plasma"] {
             let Err(e) = explicit_backend(value) else {
                 panic!("{value} must not select a backend");
             };
