@@ -47,7 +47,6 @@ wayrdp for you. Leave the RDP backend on **Auto**, create the VM, and open it in
 - **Lock screen:** the lock screen isn't streamed. VMCreate turns the idle lock off.
 - **Keyboard layout:** on KDE and GNOME, keys follow the guest's keyboard layout, so set it to
   match your client.
-- **Clipboard:** works on Hyprland and KDE, but not yet on GNOME.
 - **Codec:** RemoteFX only, with no H.264, so text and gradients are less sharp than on a native
   Windows session.
 - **Other compositors:** Sway and other wlroots compositors aren't supported.
