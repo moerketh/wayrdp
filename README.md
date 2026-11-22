@@ -115,7 +115,7 @@ Open the VM in VMConnect, and the Enhanced Session resolution dialog appears.
 `/usr/local/bin/wayrdp` and a systemd **user** unit:
 
 ```sh
-tar xf wayrdp-<version>-linux-x86_64.tar.gz && cd wayrdp-<version>
+tar xf wayrdp-<version>-linux-x86_64.tar.gz && cd wayrdp-<version>-linux-x86_64
 sudo ./install.sh
 systemctl --user enable --now wayrdp
 ```
